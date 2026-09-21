@@ -1,0 +1,72 @@
+name: Release
+
+# Runs only when a version tag is pushed (v0.1.0, ...). Builds binaries for the common platforms,
+# attaches them to a GitHub release, and publishes a multi-arch container image to ghcr.io.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  binaries:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-musl,  name: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-aarch64 }
+          - { os: macos-latest,     target: aarch64-apple-darwin,       name: macos-aarch64 }
+          - { os: macos-13,         target: x86_64-apple-darwin,        name: macos-x86_64 }
+          - { os: windows-latest,   target: x86_64-pc-windows-msvc,     name: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          ext=""; [ "${{ matrix.os }}" = "windows-latest" ] && ext=".exe"
+          mkdir dist
+          cp "target/${{ matrix.target }}/release/modelgate$ext" dist/
+          cp README.md LICENSE chains.example.json dist/
+          tar -czf "modelgate-${{ github.ref_name }}-${{ matrix.name }}.tar.gz" -C dist .
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: modelgate-*.tar.gz
+          generate_release_notes: true
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

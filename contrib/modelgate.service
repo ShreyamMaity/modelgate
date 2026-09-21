@@ -1,0 +1,23 @@
+[Unit]
+Description=modelgate - failover chains for Tailscale Aperture
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=modelgate
+StateDirectory=modelgate
+Environment=CONFIG=/var/lib/modelgate/chains.json
+Environment=LISTEN=127.0.0.1:8080
+Environment=UPSTREAM=http://ai
+# Environment=ADMIN_TOKEN=change-me
+ExecStart=/usr/local/bin/modelgate
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

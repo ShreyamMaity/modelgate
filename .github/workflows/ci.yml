@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image (not pushed)
+        run: docker build -t modelgate:ci .
+      - name: Smoke test
+        run: |
+          docker run -d --name mc -p 8080:8080 -e UPSTREAM=http://127.0.0.1:9 modelgate:ci
+          for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8080/health && exit 0; sleep 1; done
+          docker logs mc; exit 1

@@ -1,0 +1,20 @@
+{
+  "upstream": "http://ai",
+  "paid_providers": ["aperture"],
+  "chains": {
+    "fast": ["provider-a/small-model", "provider-b/small-model"],
+    "smart": ["provider-a/large-model", "provider-b/large-model", "provider-c/*"]
+  },
+  "routes": {
+    "/v1/embeddings": {
+      "targets": [
+        {
+          "label": "openai-embeddings",
+          "base": "https://api.openai.com",
+          "model": "text-embedding-3-small",
+          "key_env": "OPENAI_API_KEY"
+        }
+      ]
+    }
+  }
+}

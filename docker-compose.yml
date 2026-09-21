@@ -1,0 +1,17 @@
+# Run modelgate next to your tailnet node. See README.md ("Deploy").
+services:
+  modelgate:
+    # Image is auto-built on every push to the default branch and pushed to ghcr.io
+    # (multi-arch); versioned tags on `v*` releases. Once the repo is public,
+    # swap in the image below and drop `build:`.
+    # image: ghcr.io/shreyammaity/modelgate:latest
+    build: .
+    restart: unless-stopped
+    environment:
+      UPSTREAM: "http://100.x.y.z"        # your Aperture's tailnet IP (containers usually cannot resolve MagicDNS names)
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"     # recommended: protects config changes
+      # OPENAI_API_KEY: "${OPENAI_API_KEY}"   # only for `routes` entries that use key_env
+    volumes:
+      - ./data:/data                      # chains.json + history/ live here
+    ports:
+      - "127.0.0.1:8080:8080"             # localhost only; expose to the tailnet with `tailscale serve`

@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<title>Model groups</title>
+<style>
+:root{
+  --radius-sm:6px;--radius:8px;--radius-md:10px;--radius-lg:14px;--radius-xl:18px;--radius-2xl:22px;
+  --font:"Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Roboto,sans-serif;
+  --font-mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  /* light */
+  --bg:#f6f6fb;--panel:#ffffff;--panel-2:#f0f0f7;
+  --fg:#17171e;--mut:#6f6f7c;--line:#e4e4ec;
+  --accent:#635bff;--accent-2:#8b5cf6;--accent-fg:#ffffff;
+  --accent-soft:rgba(99,91,255,.10);
+  --ok:#0f9d58;--ok-soft:rgba(15,157,88,.12);--ok-fg:#0b5f38;
+  --bad:#d93a3a;--bad-soft:rgba(217,58,58,.10);
+  --warn:#b45f06;--warn-soft:rgba(180,95,6,.12);
+  --chip:rgba(99,91,255,.08);
+  --hover:rgba(0,0,0,.025);
+  --shadow:0 1px 2px rgba(15,15,40,.05),0 10px 24px rgba(15,15,40,.07);
+  --shadow-lg:0 24px 48px rgba(15,15,40,.14);
+  --ring:rgba(99,91,255,.35);
+  --glow:rgba(99,91,255,.16);
+}
+@media(prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:oklch(0.08 0.02 280);--panel:oklch(0.12 0.02 280);--panel-2:oklch(0.16 0.02 280);
+  --fg:oklch(0.95 0 0);--mut:oklch(0.65 0 0);--line:oklch(1 0 0 / 10%);
+  --accent:oklch(0.62 0.2 280);--accent-2:oklch(0.69 0.2 280);--accent-fg:oklch(0.98 0 0);
+  --accent-soft:oklch(0.62 0.2 280 / 14%);
+  --ok:#34d399;--ok-soft:rgba(52,211,153,.14);--ok-fg:#065f3a;
+  --bad:oklch(0.704 0.191 22.216);--bad-soft:oklch(0.704 0.191 22.216 / 14%);
+  --warn:#fbbf24;--warn-soft:rgba(251,191,36,.14);
+  --chip:oklch(0.62 0.2 280 / 10%);
+  --hover:oklch(1 0 0 / 4.5%);
+  --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 24px rgba(0,0,0,.35);
+  --shadow-lg:0 24px 48px rgba(0,0,0,.5);
+  --ring:oklch(0.62 0.2 280);
+  --glow:oklch(0.62 0.2 280 / 18%);
+}}
+:root[data-theme=dark]{
+  --bg:oklch(0.08 0.02 280);--panel:oklch(0.12 0.02 280);--panel-2:oklch(0.16 0.02 280);
+  --fg:oklch(0.95 0 0);--mut:oklch(0.65 0 0);--line:oklch(1 0 0 / 10%);
+  --accent:oklch(0.62 0.2 280);--accent-2:oklch(0.69 0.2 280);--accent-fg:oklch(0.98 0 0);
+  --accent-soft:oklch(0.62 0.2 280 / 14%);
+  --ok:#34d399;--ok-soft:rgba(52,211,153,.14);--ok-fg:#065f3a;
+  --bad:oklch(0.704 0.191 22.216);--bad-soft:oklch(0.704 0.191 22.216 / 14%);
+  --warn:#fbbf24;--warn-soft:rgba(251,191,36,.14);
+  --chip:oklch(0.62 0.2 280 / 10%);
+  --hover:oklch(1 0 0 / 4.5%);
+  --shadow:0 1px 2px rgba(0,0,0,.45),0 10px 24px rgba(0,0,0,.35);
+  --shadow-lg:0 24px 48px rgba(0,0,0,.5);
+  --ring:oklch(0.62 0.2 280);
+  --glow:oklch(0.62 0.2 280 / 18%);
+}
+*{box-sizing:border-box}
+html{color-scheme:light dark}
+body{
+  margin:0;min-height:100vh;
+  font:14px/1.5 var(--font);
+  color:var(--fg);
+  background:
+    radial-gradient(1100px 560px at 88% -12%, var(--glow), transparent 55%),
+    radial-gradient(900px 520px at -8% 18%, var(--accent-soft), transparent 55%),
+    var(--bg);
+  background-attachment:fixed;
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+}
+a{color:var(--accent);transition:color .18s ease}
+a:hover{color:var(--accent-2)}
+code{font:12px var(--font-mono);background:var(--chip);padding:1px 6px;border-radius:5px}
+button,input,select{font:inherit;color:inherit}
+button{
+  cursor:pointer;border:1px solid var(--line);background:var(--panel);
+  border-radius:var(--radius-md);padding:7px 13px;font-weight:500;
+  transition:background .18s ease,border-color .18s ease,transform .12s ease,box-shadow .18s ease,color .18s ease;
+}
+button:hover:not(:disabled){background:var(--panel-2);border-color:color-mix(in srgb,var(--line) 55%,var(--accent) 22%)}
+button:active:not(:disabled){transform:translateY(1px)}
+button:disabled{opacity:.4;cursor:default}
+button.primary{
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  color:var(--accent-fg);border-color:transparent;font-weight:600;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 6px 18px color-mix(in srgb,var(--accent) 35%,transparent);
+}
+button.primary:hover:not(:disabled){filter:brightness(1.07);box-shadow:inset 0 1px 0 rgba(255,255,255,.16),0 10px 24px color-mix(in srgb,var(--accent) 45%,transparent)}
+button.ghost{border-color:transparent;background:transparent}
+button.ghost:hover:not(:disabled){background:var(--hover);color:var(--fg)}
+button.danger{color:var(--bad)}
+button.danger:hover:not(:disabled){background:var(--bad-soft)}
+input[type=text],input[type=number],input[type=search],select{
+  border:1px solid var(--line);background:var(--panel-2);
+  border-radius:var(--radius-md);padding:7px 11px;min-width:0;
+  transition:border-color .18s ease,box-shadow .18s ease;
+}
+input:focus-visible,button:focus-visible,select:focus-visible{outline:2px solid var(--ring);outline-offset:2px}
+input:focus-visible{border-color:var(--accent)}
+main{display:grid;grid-template-columns:260px 1fr;gap:18px;padding:20px;max-width:1240px;margin:0 auto;padding-bottom:110px}
+@media(max-width:760px){main{grid-template-columns:1fr}}
+main > section{animation:fade-up .5s cubic-bezier(.2,.8,.3,1) both}
+main > section:nth-child(2){animation-delay:.09s}
+header{
+  display:flex;align-items:center;gap:14px;padding:14px 20px;
+  border-bottom:1px solid var(--line);
+  background:color-mix(in srgb,var(--panel) 78%,transparent);
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  position:sticky;top:0;z-index:10;
+}
+.brand{display:flex;align-items:center;gap:10px}
+.brand-dot{
+  width:12px;height:12px;border-radius:50%;
+  background:linear-gradient(135deg,var(--accent),var(--accent-2));
+  box-shadow:0 0 12px color-mix(in srgb,var(--accent) 55%,transparent);
+  animation:pulse 3s ease-in-out infinite;
+}
+header h1{font-size:17px;margin:0;font-weight:650;letter-spacing:-.01em}
+header .sp{flex:1}
+.card{
+  background:color-mix(in srgb,var(--panel) 90%,transparent);
+  border:1px solid var(--line);border-radius:var(--radius-xl);
+  box-shadow:var(--shadow);
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  overflow:hidden;
+}
+.card h2{
+  font-size:11px;margin:0;padding:13px 16px;color:var(--mut);
+  text-transform:uppercase;letter-spacing:.08em;font-weight:600;
+  border-bottom:1px solid var(--line);
+}
+#groups{list-style:none;margin:0;padding:8px}
+#groups li button{
+  display:flex;width:100%;justify-content:space-between;align-items:center;
+  border:0;background:transparent;text-align:left;
+  padding:10px 12px;border-radius:var(--radius-md);font-weight:500;
+  transition:background .18s ease;
+}
+#groups li button:hover:not(:disabled){background:var(--hover)}
+#groups li button[aria-current=true]{
+  background:var(--accent-soft);font-weight:600;
+  box-shadow:inset 3px 0 0 var(--accent);
+}
+#groups .n{color:var(--mut);font-size:12px}
+.newg{display:flex;gap:8px;padding:8px 12px 14px}
+.newg input{flex:1}
+.editor{padding:0}
+.ehead{display:flex;gap:10px;align-items:center;padding:15px 16px;flex-wrap:wrap;border-bottom:1px solid var(--line)}
+.ehead input{font-weight:650;font-size:16px;width:220px;max-width:100%;background:transparent;border:1px solid transparent;border-radius:var(--radius-md);padding:6px 10px}
+.ehead input:focus-visible{border-color:var(--accent);outline:none}
+.hint{color:var(--mut);font-size:12.5px}
+#entries{list-style:none;margin:0;padding:8px}
+.row{
+  display:grid;grid-template-columns:22px 26px 1fr auto;gap:8px;align-items:center;
+  padding:10px 8px;border-radius:var(--radius-lg);
+  border:1px solid transparent;
+  transition:background .16s ease,border-color .16s ease;
+}
+.row:hover{background:var(--hover);border-color:color-mix(in srgb,var(--line) 55%,var(--accent) 14%)}
+.row.drag{opacity:.35;transform:translateY(2px)}
+.row.over{border-color:var(--accent);background:var(--accent-soft)}
+.grip{cursor:grab;color:var(--mut);text-align:center;user-select:none}
+.idx{color:var(--mut);font-variant-numeric:tabular-nums;text-align:right;font-size:12px}
+.main{min-width:0}
+.spec{font:13px var(--font-mono);overflow-wrap:anywhere}
+.meta{color:var(--mut);font-size:12px;display:flex;gap:10px;flex-wrap:wrap;margin-top:3px}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:999px;background:var(--chip);color:var(--fg);margin-right:6px;vertical-align:1px}
+.tag.paid{color:var(--warn);background:var(--warn-soft)}
+.tag.grp{color:var(--accent-2);background:var(--accent-soft)}
+.acts{display:flex;gap:2px;align-items:center}
+.acts button{padding:3px 9px;border-color:transparent;background:transparent;color:var(--mut);font-size:12px}
+.acts button:hover:not(:disabled){color:var(--fg);background:var(--hover)}
+.res{font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;margin-right:6px}
+.res.ok{color:var(--ok);background:var(--ok-soft)}
+.res.bad{color:var(--bad);background:var(--bad-soft)}
+.cool{color:var(--warn);font-weight:500}
+.empty{padding:28px 16px;color:var(--mut);text-align:center}
+.bar{padding:11px 16px;display:flex;gap:8px;flex-wrap:wrap;border-top:1px solid var(--line);align-items:center}
+details.set{margin:0;padding:0;border-top:1px solid var(--line)}
+details.set summary{cursor:pointer;padding:13px 16px;color:var(--mut);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.08em;list-style:none}
+details.set summary::-webkit-details-marker{display:none}
+details.set[open] summary::after{content:" ‑";color:var(--accent-2)}
+.sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;padding:6px 16px 16px}
+.sgrid label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--mut)}
+.sgrid input{color:var(--fg)}
+.savebar{
+  position:fixed;left:0;right:0;bottom:0;
+  background:color-mix(in srgb,var(--panel) 85%,transparent);
+  border-top:1px solid var(--line);
+  backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);
+  padding:11px 18px;display:flex;gap:10px;align-items:center;justify-content:center;z-index:5;
+}
+.savebar .msg{color:var(--mut)}
+.savebar .msg.dirty{color:var(--warn);font-weight:600}
+dialog{
+  border:1px solid var(--line);border-radius:var(--radius-2xl);
+  background:var(--panel);color:var(--fg);padding:0;
+  width:min(720px,94vw);max-height:86vh;box-shadow:var(--shadow-lg);
+}
+dialog::backdrop{background:rgba(0,0,0,.5)}
+.dh{display:flex;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line);align-items:center;flex-wrap:wrap}
+.dh h3{margin:0;font-size:15px;font-weight:600;flex:1}
+.dh input[type=search]{flex:1 1 180px}
+.list{overflow:auto;max-height:56vh;padding:6px}
+.list::-webkit-scrollbar{width:8px}
+.list::-webkit-scrollbar-track{background:transparent}
+.list::-webkit-scrollbar-thumb{background:var(--line);border-radius:999px}
+.list::-webkit-scrollbar-thumb:hover{background:var(--mut)}
+.pick{display:grid;grid-template-columns:24px 1fr auto;gap:8px;align-items:center;padding:8px 10px;border-radius:var(--radius-md);cursor:pointer;transition:background .14s ease}
+.pick:hover{background:var(--hover)}
+.pick.in{opacity:.45}
+.pick input{margin:0}
+.df{display:flex;gap:8px;padding:12px 16px;border-top:1px solid var(--line);align-items:center;flex-wrap:wrap}
+.df .sp{flex:1}
+.toast{
+  position:fixed;top:16px;left:50%;transform:translateX(-50%) translateY(-8px);
+  background:var(--panel);color:var(--fg);
+  padding:10px 18px;border-radius:var(--radius-lg);
+  z-index:20;max-width:90vw;border:1px solid var(--line);
+  box-shadow:var(--shadow-lg);
+  animation:slide-in .25s cubic-bezier(.2,.8,.3,1) both;
+}
+.toast.err{background:var(--bad);color:#fff;border-color:var(--bad)}
+.tabs{display:flex;gap:2px;padding:10px 16px 0}
+.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;padding:7px 12px;font-weight:500;transition:border-color .16s ease,color .16s ease}
+.tabs button:hover{color:var(--fg)}
+.tabs button[aria-selected=true]{border-color:var(--accent);font-weight:600}
+@keyframes pulse{
+  0%,100%{box-shadow:0 0 10px color-mix(in srgb,var(--accent) 40%,transparent);transform:scale(1)}
+  50%{box-shadow:0 0 18px color-mix(in srgb,var(--accent) 70%,transparent);transform:scale(1.08)}
+}
+@keyframes fade-up{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slide-in{from{opacity:0;transform:translateX(-50%) translateY(-10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="brand-dot" aria-hidden="true"></span><h1>Model groups</h1></div>
+  <span class="hint">Each group is a failover list: the gateway tries entries top to bottom.</span>
+  <span class="sp"></span>
+  <a href="/_gateway/">Live activity</a>
+  <button id="btnHistory" class="ghost">History</button>
+</header>
+
+<main>
+  <section class="card" aria-label="Groups">
+    <h2>Groups</h2>
+    <ul id="groups"></ul>
+    <form class="newg" id="newForm">
+      <input type="text" id="newName" placeholder="New group name" maxlength="40" aria-label="New group name" autocomplete="off">
+      <button class="primary" type="submit">Add</button>
+    </form>
+    <details class="set">
+      <summary>Timeouts &amp; limits</summary>
+      <div class="sgrid" id="settings"></div>
+    </details>
+  </section>
+
+  <section class="card editor" aria-label="Group editor" id="editor"></section>
+</main>
+
+<div class="savebar">
+  <span class="msg" id="saveMsg">Loading&hellip;</span>
+  <button id="btnDiscard" disabled>Discard changes</button>
+  <button id="btnSave" class="primary" disabled>Save</button>
+</div>
+
+<dialog id="picker" aria-labelledby="pickTitle">
+  <div class="dh">
+    <h3 id="pickTitle">Add to group</h3>
+    <button class="ghost" data-close aria-label="Close">&#x2715;</button>
+  </div>
+  <div class="tabs" role="tablist">
+    <button role="tab" id="tabModels" aria-selected="true">Models</button>
+    <button role="tab" id="tabGroups" aria-selected="false">Other groups</button>
+    <button role="tab" id="tabCustom" aria-selected="false">Custom</button>
+  </div>
+  <div id="pickModels">
+    <div class="dh">
+      <input type="search" id="q" placeholder="Search models" aria-label="Search models" autocomplete="off">
+      <select id="prov" aria-label="Filter by provider"></select>
+      <label class="hint"><input type="checkbox" id="hidePaid" checked> hide paid</label>
+    </div>
+    <div class="list" id="modelList"></div>
+  </div>
+  <div id="pickGroups" hidden><div class="list" id="groupList"></div></div>
+  <div id="pickCustom" hidden style="padding:14px">
+    <p class="hint">Type any entry: an exact <code>provider/model</code>, a whole provider as <code>provider/*</code>, or a model id.</p>
+    <form id="customForm" style="display:flex;gap:8px"><input type="text" id="customText" style="flex:1" placeholder="e.g. ollama/*" autocomplete="off"><button class="primary">Add</button></form>
+  </div>
+  <div class="df" id="pickFoot">
+    <span class="hint" id="pickCount">0 selected</span><span class="sp"></span>
+    <button id="btnWild" hidden>Add whole provider</button>
+    <button class="primary" id="btnAddSel" disabled>Add selected</button>
+  </div>
+</dialog>
+
+<dialog id="hist" aria-labelledby="histTitle">
+  <div class="dh"><h3 id="histTitle">History</h3><button class="ghost" data-close aria-label="Close">&#x2715;</button></div>
+  <div class="list" id="histList"></div>
+  <div class="df"><span class="hint">Every save keeps the previous version here (newest 40). Restoring saves your current state first.</span></div>
+</dialog>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+let PAID = new Set();                          // providers billed per token; set from "paid_providers" in the config
+const el = (tag, props = {}, ...kids) => {     // tiny DOM builder; text is always textContent (no injection)
+  const n = Object.assign(document.createElement(tag), props);
+  for (const k of kids.flat()) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+};
+const S = { chains: {}, saved: "", settings: {}, defaults: {}, version: "", sel: null };
+let MODELS = [], STATUS = { cooling_down: {}, served: {} }, RESULTS = {}, pickSel = new Set(), tab = "models";
+
+const snapshot = () => JSON.stringify({ c: S.chains, s: S.settings });
+const dirty = () => snapshot() !== S.saved;
+const fmtCtx = n => n ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1000) + "k") + " ctx" : "";
+const fmtPrice = p => { const v = parseFloat(p); return isNaN(v) ? "" : v === 0 ? "free" : "$" + (v * 1e6).toFixed(2) + "/M in"; };
+const info = spec => MODELS.find(m => m.spec === spec);
+const kindOf = e => e.endsWith("/*") ? "provider" : (e in S.chains ? "group" : "model");
+
+function toast(msg, err) {
+  const t = el("div", { className: "toast" + (err ? " err" : ""), role: "status" }, msg);
+  document.body.append(t); setTimeout(() => t.remove(), err ? 6000 : 2200);
+}
+const tokenGet = () => { try { return sessionStorage.getItem("mc_token") || ""; } catch { return ""; } };
+async function api(path, opt, retried) {
+  const headers = { "Content-Type": "application/json" };
+  if (tokenGet()) headers.Authorization = "Bearer " + tokenGet();
+  const r = await fetch(path, Object.assign({ headers }, opt));
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && !retried) {              // the server has ADMIN_TOKEN set
+    const t = prompt("This server needs an admin token to change settings:");
+    if (t) { try { sessionStorage.setItem("mc_token", t); } catch {} return api(path, opt, true); }
+  }
+  if (!r.ok) throw Object.assign(new Error(j.error || r.statusText), { status: r.status });
+  return j;
+}
+
+async function load() {
+  const [cfg, models, st] = await Promise.all([api("/_gateway/config"), api("/v1/models"), api("/_gateway/status")]);
+  S.chains = cfg.chains; S.settings = cfg.settings; S.defaults = cfg.defaults; S.version = cfg.version;
+  PAID = new Set(cfg.paid_providers || []);
+  S.saved = snapshot();
+  const seen = new Set();
+  MODELS = models.data.filter(m => (m.metadata?.provider?.id) && m.metadata.provider.id !== "ai-gateway")
+    .map(m => ({ spec: m.metadata.provider.id + "/" + m.id, provider: m.metadata.provider.id, id: m.id,
+                 ctx: m.context_window_tokens, price: m.pricing?.input }))
+    .filter(m => !seen.has(m.spec) && seen.add(m.spec));
+  STATUS = st;
+  if (!(S.sel in S.chains)) S.sel = Object.keys(S.chains)[0] || null;
+  render();
+}
+
+/* ---------- rendering ---------- */
+function render() { renderGroups(); renderEditor(); renderSettings(); renderBar(); }
+
+function renderGroups() {
+  const ul = $("#groups"); ul.replaceChildren();
+  for (const name of Object.keys(S.chains)) {
+    const b = el("button", { type: "button" }, el("span", {}, name), el("span", { className: "n" }, S.chains[name].length));
+    if (name === S.sel) b.setAttribute("aria-current", "true");
+    b.onclick = () => { S.sel = name; RESULTS = {}; render(); };
+    ul.append(el("li", {}, b));
+  }
+  if (!ul.children.length) ul.append(el("li", { className: "empty" }, "No groups yet."));
+}
+
+function health(spec) {
+  const cd = Object.entries(STATUS.cooling_down || {}).find(([k]) => k.endsWith(":" + spec));
+  return cd ? el("span", { className: "cool", title: "recently failed: " + cd[1].last }, "cooling down " + cd[1].seconds_left + "s") : null;
+}
+
+function renderEditor() {
+  const ed = $("#editor"); ed.replaceChildren();
+  const name = S.sel;
+  if (!name) { ed.append(el("div", { className: "empty" }, "Create a group on the left to get started.")); return; }
+  const list = S.chains[name];
+
+  const nameIn = el("input", { type: "text", value: name, maxLength: 40, "aria-label": "Group name" });
+  nameIn.onchange = () => renameGroup(name, nameIn.value.trim(), nameIn);
+  const copy = el("button", { type: "button" }, "Copy name");
+  copy.onclick = () => navigator.clipboard?.writeText(name).then(() => toast("Copied “" + name + "”"), () => toast(name));
+  const del = el("button", { type: "button", className: "danger" }, "Delete group");
+  del.onclick = () => { if (confirm("Delete group “" + name + "”?")) { delete S.chains[name]; S.sel = Object.keys(S.chains)[0] || null; render(); } };
+  ed.append(el("div", { className: "ehead" }, nameIn, copy, del,
+    el("span", { className: "hint" }, "Use it as the model name, e.g. ", el("code", {}, "--model " + name))));
+
+  const ul = el("ul", { id: "entries" });
+  if (!list.length) ul.append(el("li", { className: "empty" }, "This group is empty. Add models below."));
+  list.forEach((spec, i) => ul.append(rowFor(list, spec, i)));
+  ed.append(ul);
+
+  const add = el("button", { type: "button", className: "primary" }, "+ Add models");
+  add.onclick = openPicker;
+  const test = el("button", { type: "button", title: "Sends one tiny request (8 tokens) to each entry" }, "Test entries");
+  test.onclick = () => testGroup(test);
+  ed.append(el("div", { className: "bar" }, add, test,
+    el("span", { className: "hint", style: "align-self:center" }, "Order matters: the first healthy entry answers.")));
+}
+
+function rowFor(list, spec, i) {
+  const k = kindOf(spec), m = info(spec);
+  const li = el("li", { className: "row", draggable: true });
+  const main = el("div", { className: "main" });
+  const tagText = k === "provider" ? "all models" : k === "group" ? "group" : (m ? m.provider : "unknown");
+  const tag = el("span", { className: "tag" + (k === "group" ? " grp" : "") + (m && PAID.has(m.provider) ? " paid" : "") }, tagText);
+  main.append(el("div", {}, tag, el("span", { className: "spec" }, k === "model" && m ? m.id : spec)));
+  const meta = el("div", { className: "meta" });
+  if (k === "provider") {
+    const n = MODELS.filter(x => x.provider === spec.slice(0, -2)).length;
+    meta.append(n + " models, in the provider's order");
+  } else if (k === "group") meta.append(S.chains[spec].length + " entries, expanded in place");
+  else if (m) {
+    for (const t of [fmtCtx(m.ctx), fmtPrice(m.price), PAID.has(m.provider) ? "paid provider" : ""]) if (t) meta.append(el("span", {}, t));
+  } else meta.append("not in the upstream model list right now");
+  const h = health(spec); if (h) meta.append(h);
+  const served = STATUS.served?.[spec]; if (served) meta.append(el("span", {}, "answered " + served + "x"));
+  main.append(meta);
+  const r = RESULTS[spec];
+  const res = r ? el("span", { className: "res " + (r.status === 200 ? "ok" : "bad"), title: r.ms + " ms" }, r.status === 200 ? "ok " + r.ms + "ms" : String(r.status)) : null;
+
+  const up = el("button", { type: "button", title: "Move up", "aria-label": "Move up" }, "↑");
+  const dn = el("button", { type: "button", title: "Move down", "aria-label": "Move down" }, "↓");
+  const rm = el("button", { type: "button", title: "Remove", "aria-label": "Remove", className: "danger" }, "✕");
+  up.disabled = i === 0; dn.disabled = i === list.length - 1;
+  up.onclick = () => move(list, i, i - 1); dn.onclick = () => move(list, i, i + 1);
+  rm.onclick = () => { list.splice(i, 1); render(); };
+  li.append(el("span", { className: "grip", title: "Drag to reorder" }, "⋮⋮"), el("span", { className: "idx" }, i + 1), main,
+            el("span", { className: "acts" }, res || "", up, dn, rm));
+  li.ondragstart = e => { e.dataTransfer.setData("text/plain", String(i)); li.classList.add("drag"); };
+  li.ondragend = () => li.classList.remove("drag");
+  li.ondragover = e => { e.preventDefault(); li.classList.add("over"); };
+  li.ondragleave = () => li.classList.remove("over");
+  li.ondrop = e => { e.preventDefault(); move(list, +e.dataTransfer.getData("text/plain"), i); };
+  return li;
+}
+function move(list, from, to) {
+  if (to < 0 || to >= list.length || from === to) return;
+  list.splice(to, 0, list.splice(from, 1)[0]); render();
+}
+
+function renameGroup(old, neu, input) {
+  if (neu === old) return;
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(neu)) { toast("Names use letters, digits . _ - only (max 40)", true); input.value = old; return; }
+  if (neu in S.chains) { toast("A group called “" + neu + "” already exists", true); input.value = old; return; }
+  const next = {};
+  for (const [k, v] of Object.entries(S.chains)) next[k === old ? neu : k] = v.map(e => e === old ? neu : e);
+  S.chains = next; S.sel = neu; render();
+}
+
+document.querySelector("#newForm").onsubmit = e => {
+  e.preventDefault();
+  const n = $("#newName").value.trim();
+  if (!/^[A-Za-z0-9._-]{1,40}$/.test(n)) return toast("Names use letters, digits . _ - only (max 40)", true);
+  if (n in S.chains) return toast("That group already exists", true);
+  S.chains[n] = []; S.sel = n; $("#newName").value = ""; render();
+};
+
+async function testGroup(btn) {
+  const list = S.chains[S.sel]; if (!list.length) return;
+  btn.disabled = true; btn.textContent = "Testing…";
+  try {
+    const { results, truncated } = await api("/_gateway/test", { method: "POST", body: JSON.stringify({ entries: list }) });
+    RESULTS = {}; for (const r of results) RESULTS[r.target] = r;
+    const bad = results.filter(r => r.status !== 200).length;
+    toast(results.length + " tested, " + (bad ? bad + " failing" : "all OK") + (truncated ? " (first 40 only)" : ""), !!bad);
+    STATUS = await api("/_gateway/status");
+  } catch (e) { toast("Test failed: " + e.message, true); }
+  btn.disabled = false; btn.textContent = "Test entries"; render();
+}
+
+function renderSettings() {
+  const box = $("#settings"); box.replaceChildren();
+  const defs = [["ttfb_stream", "Streaming: wait for first token (s)"], ["timeout", "Non-streaming: total wait (s)"],
+                ["stream_idle", "Streaming: max pause between chunks (s)"], ["max_tokens_cap", "Cap on max output tokens"]];
+  for (const [k, label] of defs) {
+    const i = el("input", { type: "number", min: 1, value: S.settings[k] ?? "", placeholder: "default " + S.defaults[k] });
+    i.oninput = () => { if (i.value === "") delete S.settings[k]; else S.settings[k] = Number(i.value); renderBar(); };
+    box.append(el("label", {}, label, i));
+  }
+}
+
+function renderBar() {
+  const d = dirty();
+  const m = $("#saveMsg"); m.textContent = d ? "Unsaved changes" : "All changes saved"; m.className = "msg" + (d ? " dirty" : "");
+  $("#btnSave").disabled = !d; $("#btnDiscard").disabled = !d;
+}
+window.onbeforeunload = e => { if (dirty()) { e.preventDefault(); e.returnValue = ""; } };
+
+$("#btnSave").onclick = async () => {
+  try {
+    const r = await api("/_gateway/config", { method: "PUT", body: JSON.stringify({ chains: S.chains, settings: S.settings, version: S.version }) });
+    S.version = r.version; S.saved = snapshot(); renderBar(); toast("Saved. Live now.");
+  } catch (e) {
+    toast(e.status === 409 ? e.message : "Not saved: " + e.message, true);
+  }
+};
+$("#btnDiscard").onclick = () => { const o = JSON.parse(S.saved); S.chains = o.c; S.settings = o.s; if (!(S.sel in S.chains)) S.sel = Object.keys(S.chains)[0] || null; render(); };
+
+/* ---------- picker ---------- */
+function openPicker() {
+  pickSel = new Set(); tab = "models";
+  const provs = [...new Set(MODELS.map(m => m.provider))].sort();
+  const sel = $("#prov"); sel.replaceChildren(el("option", { value: "" }, "All providers"));
+  for (const p of provs) sel.append(el("option", { value: p }, p + (PAID.has(p) ? " (paid)" : "")));
+  $("#q").value = ""; renderTabs(); renderPick(); $("#picker").showModal(); $("#q").focus();
+}
+function renderTabs() {
+  for (const [id, t] of [["tabModels", "models"], ["tabGroups", "groups"], ["tabCustom", "custom"]]) $("#" + id).setAttribute("aria-selected", tab === t);
+  $("#pickModels").hidden = tab !== "models"; $("#pickGroups").hidden = tab !== "groups"; $("#pickCustom").hidden = tab !== "custom";
+  $("#pickFoot").hidden = tab === "custom";
+}
+for (const [id, t] of [["tabModels", "models"], ["tabGroups", "groups"], ["tabCustom", "custom"]]) $("#" + id).onclick = () => { tab = t; pickSel = new Set(); renderTabs(); renderPick(); };
+
+function pickRow(spec, top, sub, right, disabled) {
+  const cb = el("input", { type: "checkbox", checked: pickSel.has(spec), disabled });
+  const row = el("label", { className: "pick" + (disabled ? " in" : "") }, cb,
+    el("span", {}, el("span", { className: "spec" }, top), sub ? el("span", { className: "hint" }, "  " + sub) : ""), el("span", { className: "hint" }, right || ""));
+  cb.onchange = () => { cb.checked ? pickSel.add(spec) : pickSel.delete(spec); updateCount(); };
+  return row;
+}
+function renderPick() {
+  const cur = new Set(S.chains[S.sel] || []);
+  const box = $("#modelList"); box.replaceChildren();
+  const q = $("#q").value.toLowerCase(), prov = $("#prov").value, hidePaid = $("#hidePaid").checked;
+  const shown = MODELS.filter(m => (!prov || m.provider === prov) && !(hidePaid && PAID.has(m.provider) && !prov) &&
+                                   (!q || (m.spec + " " + m.provider).toLowerCase().includes(q)));
+  for (const m of shown) box.append(pickRow(m.spec, m.id, m.provider + (PAID.has(m.provider) ? " · paid" : ""),
+    [fmtCtx(m.ctx), fmtPrice(m.price)].filter(Boolean).join(" · "), cur.has(m.spec)));
+  if (!shown.length) box.append(el("div", { className: "empty" }, "No models match."));
+  const g = $("#groupList"); g.replaceChildren();
+  const others = Object.keys(S.chains).filter(n => n !== S.sel);
+  for (const n of others) g.append(pickRow(n, n, S.chains[n].length + " entries", "", cur.has(n)));
+  if (!others.length) g.append(el("div", { className: "empty" }, "No other groups to reference yet."));
+  const w = $("#btnWild"); const wildOk = tab === "models" && prov && !cur.has(prov + "/*");
+  w.hidden = !wildOk; if (wildOk) w.textContent = "Add all " + prov + " models";
+  updateCount();
+}
+function updateCount() { $("#pickCount").textContent = pickSel.size + " selected"; $("#btnAddSel").disabled = !pickSel.size; }
+$("#q").oninput = renderPick; $("#prov").onchange = renderPick; $("#hidePaid").onchange = renderPick;
+function addEntries(items) {
+  const list = S.chains[S.sel]; let n = 0;
+  for (const s of items) if (!list.includes(s) && list.length < 40) { list.push(s); n++; }
+  return n;
+}
+$("#btnAddSel").onclick = () => { const n = addEntries([...pickSel]); $("#picker").close(); render(); toast(n + " added"); };
+$("#btnWild").onclick = () => { addEntries([$("#prov").value + "/*"]); $("#picker").close(); render(); };
+$("#customForm").onsubmit = e => {
+  e.preventDefault(); const v = $("#customText").value.trim().replace(/\|/g, "");
+  if (!v) return; addEntries([v]); $("#customText").value = ""; $("#picker").close(); render();
+};
+document.querySelectorAll("[data-close]").forEach(b => b.onclick = () => b.closest("dialog").close());
+
+/* ---------- history ---------- */
+$("#btnHistory").onclick = async () => {
+  const box = $("#histList"); box.replaceChildren(el("div", { className: "empty" }, "Loading…")); $("#hist").showModal();
+  try {
+    const h = await api("/_gateway/config/history"); box.replaceChildren();
+    if (!h.length) box.append(el("div", { className: "empty" }, "No history yet. It starts with your first save."));
+    for (const e of h) {
+      const b = el("button", { type: "button" }, "Restore");
+      b.onclick = async () => {
+        if (dirty() && !confirm("You have unsaved changes; restoring replaces them. Continue?")) return;
+        try { await api("/_gateway/config/restore", { method: "POST", body: JSON.stringify({ file: e.file }) }); $("#hist").close(); await load(); toast("Restored"); }
+        catch (err) { toast("Restore failed: " + err.message, true); }
+      };
+      box.append(el("div", { className: "pick", style: "grid-template-columns:1fr auto" },
+        el("span", {}, el("span", { className: "spec" }, e.when), el("span", { className: "hint" }, "  " + e.groups + " groups" + (e.note && e.note !== "save" ? " · " + e.note : ""))), b));
+    }
+  } catch (e) { box.replaceChildren(el("div", { className: "empty" }, "Could not load history: " + e.message)); }
+};
+
+load().catch(e => { $("#saveMsg").textContent = "Could not load: " + e.message; });
+</script>
+</body>
+</html>

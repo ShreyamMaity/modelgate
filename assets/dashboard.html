@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>modelgate activity</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--fg:#1b1b1f;--mut:#6b6b76;--line:#e3e3e8;--ok:#127a3d;--bad:#b3261e;--chip:#eef0fb}
+@media(prefers-color-scheme:dark){:root{--bg:#131316;--fg:#ececf1;--mut:#9a9aa6;--line:#2a2a31;--ok:#5fd08a;--bad:#ff8a80;--chip:#242838}}
+body{margin:0 auto;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif;padding:16px;max-width:1000px}
+h1{font-size:18px;margin:0 0 4px}p{color:var(--mut);margin:0 0 14px}a{color:inherit}
+table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--mut);font-weight:500}code{font:12px ui-monospace,monospace}.bad{color:var(--bad)}.ok{color:var(--ok)}.wrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>modelgate activity</h1>
+<p id="meta">loading&hellip;</p>
+<p><a href="/config">Edit groups</a></p>
+<div class="wrap"><table>
+<thead><tr><th>time (UTC)<th>asked for<th>answered by<th>ms<th>tried<th>skipped</tr></thead>
+<tbody id="rows"></tbody>
+</table></div>
+<script>
+"use strict";
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+async function tick() {
+  try {
+    const [r, s] = await Promise.all([fetch("/_gateway/recent").then(x => x.json()), fetch("/_gateway/status").then(x => x.json())]);
+    const cd = Object.entries(s.cooling_down).map(([k, v]) => k.replace(/^\w+:/, "") + " (" + v.seconds_left + "s, " + v.last + ")");
+    document.getElementById("meta").textContent = s.requests + " requests, " + s.failovers + " failovers, " + s.errors +
+      " exhausted, upstream " + s.upstream + (cd.length ? " - cooling down: " + cd.join(", ") : "");
+    document.getElementById("rows").innerHTML = r.map(x =>
+      "<tr><td>" + esc(x.time) + "<td><code>" + esc(x.requested) + "</code><td>" +
+      (x.served_by ? "<code class=ok>" + esc(x.served_by) + "</code>" : "<b class=bad>all failed</b>") +
+      "<td>" + x.ms + "<td>" + x.attempts + "<td class=bad>" + esc((x.skipped || []).map(a => a.target + " " + (a.status || a.error)).join(", "))
+    ).join("") || "<tr><td colspan=6>no requests yet";
+  } catch (e) { document.getElementById("meta").textContent = "error: " + e; }
+}
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+/target
+# Local runtime files: a real config can hold provider names and history of your edits.
+/chains.json
+/history/
+/data/
+*.tmp
+.env
