@@ -38,6 +38,7 @@ pub struct AppState {
     pub path: PathBuf,
     pub upstream: String,
     pub admin_token: Option<String>,
+    pub passthrough: bool,
     pub client: reqwest::Client,
     pub started: Instant,
     cfg: Mutex<CfgSlot>,
@@ -86,6 +87,13 @@ impl AppState {
             path,
             upstream,
             admin_token,
+            passthrough: !matches!(
+                std::env::var("PASSTHROUGH")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "0" | "false" | "off" | "no"
+            ),
             client,
             started: Instant::now(),
             cfg: Mutex::new((Arc::new(cfg), mt)),

@@ -401,3 +401,89 @@ pub async fn relay(
         ),
     }
 }
+
+pub async fn forward_raw(
+    st: &Arc<AppState>,
+    method: &axum::http::Method,
+    path_and_query: &str,
+    headers: &HeaderMap,
+    payload: Bytes,
+) -> Response<Body> {
+    let cfg = st.config();
+    let ttfb = Duration::from_secs_f64(cfg.settings.timeout);
+    let idle = Duration::from_secs_f64(cfg.settings.stream_idle);
+    let url = format!("{}{}", st.upstream.trim_end_matches('/'), path_and_query);
+    let path = path_and_query.split('?').next().unwrap_or(path_and_query);
+    let req_model = serde_json::from_slice::<Value>(&payload)
+        .ok()
+        .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_else(|| "-".into());
+    st.stats.lock().unwrap().requests += 1;
+
+    let mut rb = st.client.request(method.clone(), &url);
+    for (k, v) in headers {
+        if !HOP.contains(&k.as_str()) {
+            rb = rb.header(k, v);
+        }
+    }
+    rb = rb.header(header::ACCEPT_ENCODING, "identity");
+    if !payload.is_empty() {
+        rb = rb.body(payload);
+    }
+    let t0 = Instant::now();
+    let label = "upstream";
+    let kind = format!("passthrough:{path}");
+    let resp = match tokio::time::timeout(ttfb, rb.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            let what = if e.is_timeout() { "timeout" } else { "connect" };
+            return raw_failed(st, req_model, kind, path, what);
+        }
+        Err(_) => return raw_failed(st, req_model, kind, path, "timeout"),
+    };
+    let status = resp.status().as_u16();
+    let ms = t0.elapsed().as_millis() as u64;
+    log(
+        "served",
+        json!({"kind": kind, "path": path, "target": label, "status": status, "ttfb_ms": ms}),
+    );
+    st.note(Recent {
+        time: hms(),
+        requested: req_model,
+        kind,
+        served_by: Some(format!("{label} ({status})")),
+        ms,
+        attempts: 1,
+        skipped: vec![],
+    });
+    passthrough(resp, label, 1, idle)
+}
+
+fn raw_failed(
+    st: &Arc<AppState>,
+    requested: String,
+    kind: String,
+    path: &str,
+    what: &str,
+) -> Response<Body> {
+    st.stats.lock().unwrap().errors += 1;
+    log(
+        "exhausted",
+        json!({"kind": kind, "path": path, "error": what}),
+    );
+    st.note(Recent {
+        time: hms(),
+        requested,
+        kind,
+        served_by: None,
+        ms: 0,
+        attempts: 1,
+        skipped: vec![json!({"target": "upstream", "error": what})],
+    });
+    let code = if what == "timeout" { 504 } else { 502 };
+    json_response(
+        code,
+        &json!({"error": {"message": format!("upstream {what} error")}}),
+        &[],
+    )
+}

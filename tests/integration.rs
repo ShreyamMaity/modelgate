@@ -101,6 +101,46 @@ async fn mock(req: Request) -> Response<Body> {
             json!({"auth": hdr("authorization"), "x_api_key": hdr("x-api-key"), "model": model}),
         ),
         ("POST", "/v1/chat/completions") => chat(&model, v["stream"] == true).await,
+        (m, "/v1/files") => jr(
+            200,
+            json!({"method": m, "query": parts.uri.query().unwrap_or(""), "custom": hdr("x-custom"),
+                   "auth": hdr("authorization"), "conn": hdr("connection")}),
+        ),
+        ("POST", "/v1/audio/transcriptions") => {
+            let sum: u64 = raw.iter().map(|b| u64::from(*b)).sum();
+            jr(
+                200,
+                json!({"len": raw.len(), "sum": sum, "ct": hdr("content-type")}),
+            )
+        }
+        ("GET", "/v1/blob") => Response::builder()
+            .header("content-type", "application/octet-stream")
+            .header("x-upstream", "yes")
+            .body(Body::from((0u8..=255).collect::<Vec<u8>>()))
+            .unwrap(),
+        ("POST", "/v1/slow-sse") => {
+            let s = futures_util::stream::unfold(0u8, |i| async move {
+                if i >= 2 {
+                    return None;
+                }
+                if i == 1 {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                }
+                Some((
+                    Ok::<_, std::io::Error>(bytes::Bytes::from(format!(
+                        "data: {i}
+
+"
+                    ))),
+                    i + 1,
+                ))
+            });
+            Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(s))
+                .unwrap()
+        }
+        ("POST", "/v1/limited") => jr(429, json!({"error": {"message": "slow down"}})),
         _ => jr(404, json!({"error": "not found"})),
     }
 }
@@ -699,4 +739,115 @@ async fn broken_config_edit_keeps_last_good() {
         "a bad hand-edit must not take the gateway down"
     );
     let _ = &h.mock;
+}
+
+#[tokio::test]
+async fn unknown_v1_paths_pass_through_unchanged() {
+    let h = start(json!({"chains": {}}), None).await;
+    for m in [reqwest::Method::GET, reqwest::Method::DELETE] {
+        let r = h
+            .http
+            .request(m.clone(), format!("{}/v1/files?limit=2&after=abc", h.base))
+            .header("x-custom", "kept")
+            .header("authorization", "Bearer client-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(hdr(&r, "x-gateway-target"), "upstream");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["method"], m.as_str());
+        assert_eq!(v["query"], "limit=2&after=abc");
+        assert_eq!(v["custom"], "kept");
+        assert_eq!(
+            v["auth"], "Bearer client-key",
+            "client auth is forwarded as-is"
+        );
+        assert_eq!(v["conn"], "", "hop-by-hop headers are stripped");
+    }
+    let body: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+    let sum: u64 = body.iter().map(|b| u64::from(*b)).sum();
+    let r = h
+        .http
+        .post(format!("{}/v1/audio/transcriptions", h.base))
+        .header("content-type", "multipart/form-data; boundary=xyz")
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["len"], body.len());
+    assert_eq!(v["sum"], sum);
+    assert_eq!(v["ct"], "multipart/form-data; boundary=xyz");
+    let r = h
+        .http
+        .get(format!("{}/v1/blob", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hdr(&r, "x-upstream"), "yes");
+    assert_eq!(hdr(&r, "content-type"), "application/octet-stream");
+    assert_eq!(
+        r.bytes().await.unwrap().to_vec(),
+        (0u8..=255).collect::<Vec<u8>>()
+    );
+    let r = h.post("/v1/limited", json!({"model": "m1"})).await;
+    assert_eq!(r.status(), 429);
+    assert_eq!(
+        r.json::<Value>().await.unwrap()["error"]["message"],
+        "slow down"
+    );
+    let r = h.post("/v1/nothing-here", json!({})).await;
+    assert_eq!(r.status(), 404);
+    assert_eq!(r.json::<Value>().await.unwrap()["error"], "not found");
+    let r = h
+        .http
+        .get(format!("{}/admin", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 404);
+    assert_eq!(hdr(&r, "x-gateway-target"), "");
+    let recent: Value = h
+        .http
+        .get(format!("{}/_gateway/recent", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        recent.to_string().contains("passthrough:/v1/files"),
+        "passthrough requests show up on the activity page"
+    );
+}
+
+#[tokio::test]
+async fn passthrough_streams_instead_of_buffering() {
+    let h = start(json!({"chains": {}}), None).await;
+    let t0 = Instant::now();
+    let r = h.post("/v1/slow-sse", json!({})).await;
+    assert_eq!(hdr(&r, "content-type"), "text/event-stream");
+    let mut s = r.bytes_stream();
+    use futures_util::StreamExt;
+    let first = s.next().await.unwrap().unwrap();
+    assert_eq!(
+        &first[..],
+        b"data: 0
+
+"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_millis(1200),
+        "first chunk must arrive before the upstream finishes"
+    );
+    let second = s.next().await.unwrap().unwrap();
+    assert_eq!(
+        &second[..],
+        b"data: 1
+
+"
+    );
+    assert!(t0.elapsed() >= Duration::from_millis(1400));
 }
