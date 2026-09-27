@@ -15,6 +15,8 @@ Every option can also be set with an environment variable:
     LISTEN       address to listen on                  (default 127.0.0.1:8080)
     UPSTREAM     the gateway to forward to             (default: \"upstream\" in the config, else http://ai)
     ADMIN_TOKEN  if set, config changes need `Authorization: Bearer <token>`
+    PASSTHROUGH  0 to answer 404 for /v1/* paths the gateway doesn't handle itself
+                 (default: forward them to the upstream unchanged, e.g. /v1/embeddings)
 
 Docs: README.md    Config UI: http://<listen>/config    Activity: http://<listen>/_gateway/
 ";

@@ -137,6 +137,8 @@ One JSON file (`chains.json`, created on first run; re-read whenever it changes;
 
 **Embeddings, images, audio.** Aperture only routes text generation. `routes` sends other endpoints straight to providers: keys are read from the environment variable named by `key_env`, never from the config file.
 
+**Everything else under `/v1`.** Any `/v1/*` request the gateway doesn't handle itself (not a chain, not a `route`) is forwarded to the upstream unchanged: same method, path, query string, body and headers, with the reply streamed back as it arrives. So `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/*` and friends work through the same base URL whenever the upstream serves them. Set `PASSTHROUGH=0` to answer 404 instead.
+
 ## Environment Variables
 
 | Variable | Default | Meaning |
@@ -145,6 +147,7 @@ One JSON file (`chains.json`, created on first run; re-read whenever it changes;
 | `LISTEN` | `127.0.0.1:8080` | address to listen on |
 | `UPSTREAM` | config `upstream`, else `http://ai` | the gateway to forward to |
 | `ADMIN_TOKEN` | unset | if set, config changes need `Authorization: Bearer <token>` |
+| `PASSTHROUGH` | on | `0` answers 404 for unhandled `/v1/*` paths instead of forwarding them to the upstream |
 
 The same options can be set as flags: `--config`, `--listen`, `--upstream`. `modelgate --help` for the full list.
 

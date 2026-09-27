@@ -2,7 +2,7 @@
 
 use crate::chain;
 use crate::config::{self, Config};
-use crate::relay::{json_response, relay, Opts, Target};
+use crate::relay::{forward_raw, json_response, relay, Opts, Target};
 use crate::shim;
 use crate::state::{log, AppState};
 use axum::body::{to_bytes, Body};
@@ -126,6 +126,14 @@ async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response<Body>
         }
         (&Method::POST, p) if cfg.routes.iter().any(|(rp, _)| rp == p) => {
             route(&st, &cfg, &parts.headers, p, raw).await
+        }
+        (m, p) if st.passthrough && p.starts_with("/v1/") => {
+            let pq = parts
+                .uri
+                .path_and_query()
+                .map(|x| x.as_str().to_owned())
+                .unwrap_or_else(|| path.clone());
+            forward_raw(&st, m, &pq, &parts.headers, raw).await
         }
         _ => json_response(
             404,
