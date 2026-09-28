@@ -42,6 +42,7 @@ pub struct AppState {
     pub passthrough: bool,
     pub client: reqwest::Client,
     pub pii: crate::pii::Pii,
+    pub presence: crate::presence::Presence,
     pub started: Instant,
     cfg: Mutex<CfgSlot>,
     health: Mutex<HashMap<String, Cool>>,
@@ -107,6 +108,7 @@ impl AppState {
             ),
             client,
             pii,
+            presence: crate::presence::Presence::from_env(),
             started: Instant::now(),
             cfg: Mutex::new((Arc::new(cfg), mt)),
             health: Mutex::new(HashMap::new()),
@@ -249,6 +251,14 @@ impl AppState {
             .unwrap_or_else(|| spec.to_owned())
     }
 
+    pub fn wants_presence(&self) -> bool {
+        let cfg = self.config();
+        cfg.targets
+            .iter()
+            .chain(cfg.routes.iter().flat_map(|r| r.1.iter()))
+            .any(|t| t.presence.is_some())
+    }
+
     /// Ids the upstream itself serves over `/v1/messages` (no translation needed for these).
     pub fn native_messages_ids(&self) -> Vec<String> {
         self.models()
@@ -261,4 +271,25 @@ impl AppState {
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned))
             .collect()
     }
+}
+
+pub fn spawn_presence(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut was_ok = None;
+        loop {
+            if st.presence.url().is_some() && st.wants_presence() {
+                let res = st.presence.poll_once(&st.client).await;
+                let good = res.is_ok();
+                if was_ok != Some(good) {
+                    let detail = match res {
+                        Ok(n) => json!(n),
+                        Err(e) => json!(e),
+                    };
+                    log("presence", json!({"ok": good, "detail": detail}));
+                    was_ok = Some(good);
+                }
+            }
+            tokio::time::sleep(st.presence.interval).await;
+        }
+    });
 }

@@ -47,6 +47,38 @@ pub struct DirectTarget {
     pub path: Option<String>,
     /// Name of an environment variable holding a bearer key (never stored in the config file).
     pub key_env: Option<String>,
+    pub presence: Option<String>,
+    pub skip_busy: bool,
+    pub timeout: Option<f64>,
+    pub max_input_chars: Option<usize>,
+}
+
+impl DirectTarget {
+    fn parse(label: Option<String>, t: &Value) -> Option<Self> {
+        let s = |k: &str| t.get(k).and_then(Value::as_str).map(str::to_owned);
+        let presence = s("presence").filter(|p| !p.is_empty());
+        let base = s("base").unwrap_or_default();
+        if base.is_empty() && presence.is_none() {
+            return None;
+        }
+        Some(DirectTarget {
+            label: label.or_else(|| s("label")).unwrap_or_else(|| base.clone()),
+            base,
+            model: s("model"),
+            path: s("path"),
+            key_env: s("key_env"),
+            presence,
+            skip_busy: t.get("skip_busy").and_then(Value::as_bool).unwrap_or(false),
+            timeout: t
+                .get("timeout")
+                .and_then(Value::as_f64)
+                .filter(|n| *n > 0.0),
+            max_input_chars: t
+                .get("max_input_chars")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +89,7 @@ pub struct Config {
     pub chains: Vec<(String, Vec<String>)>,
     pub settings: Settings,
     pub routes: Vec<(String, Vec<DirectTarget>)>,
+    pub targets: Vec<DirectTarget>,
     /// Providers shown with a "paid" badge in the UI.
     pub paid_providers: Vec<String>,
     pub upstream: Option<String>,
@@ -99,24 +132,23 @@ impl Config {
                     .and_then(Value::as_array)
                     .map(|a| {
                         a.iter()
-                            .filter_map(|t| {
-                                let base = t.get("base")?.as_str()?.to_owned();
-                                let s =
-                                    |k: &str| t.get(k).and_then(Value::as_str).map(str::to_owned);
-                                Some(DirectTarget {
-                                    label: s("label").unwrap_or_else(|| base.clone()),
-                                    base,
-                                    model: s("model"),
-                                    path: s("path"),
-                                    key_env: s("key_env"),
-                                })
-                            })
+                            .filter_map(|t| DirectTarget::parse(None, t))
                             .collect()
                     })
                     .unwrap_or_default();
                 routes.push((path.clone(), targets));
             }
         }
+        let targets = root
+            .get("targets")
+            .and_then(Value::as_object)
+            .map(|o| {
+                o.iter()
+                    .filter(|(name, _)| !name.is_empty() && !name.contains('|'))
+                    .filter_map(|(name, t)| DirectTarget::parse(Some(name.clone()), t))
+                    .collect()
+            })
+            .unwrap_or_default();
         let paid_providers = root
             .get("paid_providers")
             .and_then(Value::as_array)
@@ -136,10 +168,15 @@ impl Config {
             chains,
             settings,
             routes,
+            targets,
             paid_providers,
             upstream,
             pii,
         }
+    }
+
+    pub fn target(&self, name: &str) -> Option<&DirectTarget> {
+        self.targets.iter().find(|t| t.label == name)
     }
 
     pub fn chain(&self, name: &str) -> Option<&Vec<String>> {
@@ -377,6 +414,27 @@ mod tests {
         );
         assert_eq!(std::fs::read_dir(history_dir(&p)).unwrap().count(), 1);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn parses_named_targets() {
+        let cfg = Config::from_value(json!({"chains": {}, "targets": {
+            "local/pc": {"presence": "pc", "model": "bonsai", "timeout": 3, "skip_busy": true},
+            "local/mba": {"base": "http://10.0.0.2:8121", "model": "b8", "max_input_chars": 9000},
+            "local/bad": {"model": "x"},
+            "a|b": {"base": "http://x"}
+        }}));
+        assert_eq!(cfg.targets.len(), 2);
+        let pc = cfg.target("local/pc").unwrap();
+        assert_eq!(pc.presence.as_deref(), Some("pc"));
+        assert!(pc.base.is_empty() && pc.skip_busy);
+        assert_eq!(pc.timeout, Some(3.0));
+        let mba = cfg.target("local/mba").unwrap();
+        assert_eq!(mba.base, "http://10.0.0.2:8121");
+        assert!(mba.presence.is_none() && !mba.skip_busy);
+        assert_eq!(mba.max_input_chars, Some(9000));
+        assert_eq!(pc.max_input_chars, None);
+        assert!(cfg.target("local/bad").is_none());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use modelgate::state::{log, AppState};
+use modelgate::state::{log, spawn_presence, AppState};
 use modelgate::{config, server};
 use serde_json::json;
 use std::path::PathBuf;
@@ -21,6 +21,9 @@ Every option can also be set with an environment variable:
     PII_VAULT    JSON file of known secrets/PII that are always masked (never sent raw to masked tiers)
     PII_TTL_SECS how long a conversation's placeholder map is kept (default 21600)
     PII_REHYDRATE_TOOLS  0 to leave placeholders in tool-call arguments instead of real values
+    PRESENCE_URL tailmesh-style hub; targets with \"presence\": \"<node>\" are used only while
+                 GET <url>/presence says use_bonsai for that node (else skipped, no cooldown)
+    PRESENCE_POLL_MS / PRESENCE_MAX_AGE_MS / PRESENCE_TIMEOUT_MS   (defaults 1500 / 5000 / 800)
 
 Docs: README.md    Config UI: http://<listen>/config    Activity: http://<listen>/_gateway/
 ";
@@ -73,6 +76,8 @@ async fn main() {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
+
+    spawn_presence(st.clone());
 
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,

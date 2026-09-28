@@ -27,7 +27,13 @@ fn sse(chunks: Vec<Value>) -> Response<Body> {
         .unwrap()
 }
 
-async fn chat(model: &str, stream: bool) -> Response<Body> {
+async fn chat_body(model: &str, stream: bool, v: &Value) -> Response<Body> {
+    if model == "strict/x" && v.get("reasoning_effort").is_some() {
+        return jr(
+            400,
+            json!({"object": "error", "message": "reasoning_effort is not enabled for this model"}),
+        );
+    }
     match model {
         "dead/x" => return jr(402, json!({"error": "payment required"})),
         "flaky/x" => return jr(503, json!({"error": "unavailable"})),
@@ -194,7 +200,7 @@ async fn mock(req: Request) -> Response<Body> {
             200,
             json!({"auth": hdr("authorization"), "x_api_key": hdr("x-api-key"), "model": model}),
         ),
-        ("POST", "/v1/chat/completions") => chat(&model, v["stream"] == true).await,
+        ("POST", "/v1/chat/completions") => chat_body(&model, v["stream"] == true, &v).await,
         (m, "/v1/files") => jr(
             200,
             json!({"method": m, "query": parts.uri.query().unwrap_or(""), "custom": hdr("x-custom"),
@@ -246,6 +252,7 @@ struct H {
     mock: String,
     dir: PathBuf,
     http: reqwest::Client,
+    st: Arc<AppState>,
 }
 
 impl Drop for H {
@@ -275,12 +282,13 @@ async fn start_pii(mut config: Value, token: Option<&str>, pii: modelgate::pii::
     let st: Arc<AppState> =
         AppState::with_pii(path, mock_url.clone(), token.map(str::to_owned), pii);
     st.refresh_models().await;
-    let base = serve(modelgate::server::router(st)).await;
+    let base = serve(modelgate::server::router(st.clone())).await;
     H {
         base,
         mock: mock_url,
         dir,
         http: reqwest::Client::new(),
+        st,
     }
 }
 
@@ -1270,4 +1278,254 @@ async fn pii_tool_args_with_go_style_escapes_are_rehydrated() {
     let args: Value = serde_json::from_str(&pj).unwrap();
     assert_eq!(args["text"], FAKE);
     assert_masked(&received("echotoolgo/g1"));
+}
+
+static HUB_UP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+async fn hub(bonsai: String) -> String {
+    let (host, port) = bonsai
+        .trim_start_matches("http://")
+        .split_once(':')
+        .map(|(h, p)| (h.to_owned(), p.parse::<u16>().unwrap()))
+        .unwrap();
+    let app = axum::Router::new().fallback(move |req: Request| {
+        let host = host.clone();
+        async move {
+            if req.uri().path() != "/presence" {
+                return jr(404, json!({}));
+            }
+            let up = HUB_UP.load(std::sync::atomic::Ordering::SeqCst);
+            let (route, reason) = if up { ("bonsai", "ok") } else { ("cloud", "gpu busy (game.exe)") };
+            jr(
+                200,
+                json!({"nodes": {"pc": {"state": "up", "use_bonsai": up, "route": route, "reason": reason,
+                    "bonsai": {"host": host, "port": port, "serving": true, "busy": false}}}}),
+            )
+        }
+    });
+    serve(app).await
+}
+
+#[tokio::test]
+async fn presence_gates_a_direct_target_without_cooldown() {
+    HUB_UP.store(false, std::sync::atomic::Ordering::SeqCst);
+    let h = start(
+        json!({"chains": {"c": ["local/pc", "echo/cloud"]},
+               "targets": {"local/pc": {"presence": "pc", "model": "echo-pc"}},
+               "pii": {"tiers": {"local": ["local/*"]}}}),
+        None,
+    )
+    .await;
+    let url = hub(h.mock.clone()).await;
+    h.st.presence.set_url(Some(url));
+    h.st.presence.poll_once(&h.st.client).await.unwrap();
+
+    let t0 = Instant::now();
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "skip must be instant"
+    );
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/cloud");
+    assert_eq!(hdr(&r, "x-gateway-attempts"), "2");
+    assert!(
+        received("echo-pc").is_empty(),
+        "gated target never contacted"
+    );
+    assert_masked(&received("echo/cloud"));
+    let recent: Value = h
+        .http
+        .get(format!("{}/_gateway/recent", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        recent[0]["skipped"][0]["error"],
+        "presence: pc gpu busy (game.exe)"
+    );
+    let status: Value = h
+        .http
+        .get(format!("{}/_gateway/status", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        status["cooling_down"].as_object().unwrap().is_empty(),
+        "a presence skip is not a failure"
+    );
+    assert_eq!(status["presence"]["nodes"]["pc"]["use_bonsai"], false);
+
+    HUB_UP.store(true, std::sync::atomic::Ordering::SeqCst);
+    modelgate::state::spawn_presence(h.st.clone());
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "local/pc");
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=local; masked=0");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], FAKE);
+    let pc = received("echo-pc");
+    assert_eq!(pc.len(), 1);
+    assert!(
+        pc[0].contains("4111 1111 1111 1111"),
+        "local tier gets raw data"
+    );
+
+    h.st.presence.set_url(None);
+    let r = h.chat("c").await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/cloud");
+}
+
+#[tokio::test]
+async fn named_direct_targets_serve_alone_list_and_test() {
+    let direct = serve(axum::Router::new().fallback(mock)).await;
+    let h = start(
+        json!({"chains": {"sub": ["local/mba", "good/x"]},
+               "targets": {"local/mba": {"base": direct, "model": "echo-mba", "timeout": 5},
+                           "local/pc": {"presence": "pc", "model": "echo-pc2"}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "local/mba", "messages": [{"role": "user", "content": "hello mba"}]}),
+        )
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "local/mba");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "hello mba");
+    assert_eq!(received("echo-mba").len(), 1);
+
+    let r = h.chat("sub").await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "local/mba");
+
+    let models: Value = h
+        .http
+        .get(format!("{}/v1/models", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<String> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["direct"] == true)
+        .map(|m| {
+            format!(
+                "{}/{}",
+                m["owned_by"].as_str().unwrap(),
+                m["id"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert_eq!(ids, ["local/mba", "local/pc"]);
+
+    let r = h
+        .post("/v1/chat/completions", user_chat("local/*", "wild", false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "local/mba");
+
+    let t: Value = h
+        .post("/_gateway/test", json!({"entries": ["sub", "local/pc"]}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let res = t["results"].as_array().unwrap();
+    assert_eq!(res[0]["target"], "local/mba");
+    assert_eq!(res[0]["status"], 200);
+    assert_eq!(res[2]["target"], "local/pc");
+    assert_eq!(res[2]["status"], "skipped: no presence source");
+}
+
+#[tokio::test]
+async fn unreachable_presence_target_falls_through_to_cloud() {
+    let h = start(
+        json!({"chains": {"c": ["local/pc", "good/x"]},
+               "targets": {"local/pc": {"presence": "pc", "base": "http://127.0.0.1:1", "model": "x", "timeout": 2}}}),
+        None,
+    )
+    .await;
+    h.st.presence.set_url(Some("http://127.0.0.1:1".into()));
+    h.st.presence
+        .update(&json!({"nodes": {"pc": {"use_bonsai": true, "route": "bonsai", "reason": "ok"}}}));
+    let r = h.chat("c").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-target"), "good/x");
+    assert!(h.st.presence.poll_once(&h.st.client).await.is_err());
+    assert!(h.st.presence.status()["last_error"].is_string());
+}
+
+#[tokio::test]
+async fn small_local_target_is_skipped_for_large_inputs() {
+    let direct = serve(axum::Router::new().fallback(mock)).await;
+    let h = start(
+        json!({"chains": {"sub": ["local/tiny", "echo/big"]},
+               "targets": {"local/tiny": {"base": direct, "model": "echo-tiny", "max_input_chars": 400}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("sub", "short", false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "local/tiny");
+    let long = "word ".repeat(200);
+    let t0 = Instant::now();
+    let r = h
+        .post("/v1/chat/completions", user_chat("sub", &long, false))
+        .await;
+    assert!(t0.elapsed() < Duration::from_secs(1));
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/big");
+    assert_eq!(
+        received("echo-tiny").len(),
+        1,
+        "the long prompt never reached the small model"
+    );
+}
+
+#[tokio::test]
+async fn rejected_optional_field_is_dropped_and_the_same_target_retried() {
+    let h = start(json!({"chains": {"c": ["strict/x", "good/x"]}}), None).await;
+    let r = h
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "c", "reasoning_effort": "low", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-target"), "strict/x");
+    assert_eq!(hdr(&r, "x-gateway-attempts"), "2");
+    let sent = received("strict/x");
+    assert!(sent.iter().any(|b| b.contains("reasoning_effort")));
+    assert!(sent.iter().any(|b| !b.contains("reasoning_effort")));
+    let status: Value = h
+        .http
+        .get(format!("{}/_gateway/status", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["cooling_down"].as_object().unwrap().is_empty());
+
+    let r = h.chat("picky/x|good/x").await;
+    assert_eq!(
+        hdr(&r, "x-gateway-target"),
+        "good/x",
+        "unrelated 400s still fail over"
+    );
 }

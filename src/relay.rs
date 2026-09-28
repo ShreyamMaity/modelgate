@@ -32,7 +32,7 @@ const HOP: &[&str] = &[
     "accept-encoding",
 ];
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Target {
     pub label: String,
     pub base: String,
@@ -41,6 +41,32 @@ pub struct Target {
     /// Overrides the request path for this target.
     pub path: Option<String>,
     pub bearer: Option<String>,
+    pub presence: Option<String>,
+    pub skip_busy: bool,
+    pub ttfb: Option<f64>,
+    pub direct: bool,
+    pub max_input: Option<usize>,
+}
+
+impl Target {
+    pub fn direct(d: &crate::config::DirectTarget) -> Self {
+        Target {
+            label: d.label.clone(),
+            base: d.base.clone(),
+            model: d.model.clone(),
+            path: d.path.clone(),
+            bearer: d
+                .key_env
+                .as_ref()
+                .and_then(|k| std::env::var(k).ok())
+                .filter(|k| !k.is_empty()),
+            presence: d.presence.clone(),
+            skip_busy: d.skip_busy,
+            ttfb: d.timeout,
+            direct: true,
+            max_input: d.max_input_chars,
+        }
+    }
 }
 
 pub struct Opts<'a> {
@@ -328,6 +354,49 @@ async fn translated_buffered(
     }
 }
 
+const OPTIONAL_FIELDS: &[&str] = &[
+    "reasoning_effort",
+    "reasoning",
+    "max_completion_tokens",
+    "parallel_tool_calls",
+    "service_tier",
+    "stream_options",
+    "seed",
+    "top_k",
+    "logprobs",
+    "top_logprobs",
+    "prediction",
+    "store",
+    "metadata",
+    "user",
+    "verbosity",
+    "thinking",
+    "chat_template_kwargs",
+];
+
+pub fn without_rejected_fields(body: &[u8], err: &[u8]) -> Option<(Bytes, Vec<String>)> {
+    let mut v: Value = serde_json::from_slice(body).ok()?;
+    let obj = v.as_object_mut()?;
+    let err = String::from_utf8_lossy(err);
+    let names: Vec<String> = OPTIONAL_FIELDS
+        .iter()
+        .filter(|k| obj.contains_key(**k) && err.contains(**k))
+        .map(|k| (*k).to_owned())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    for k in &names {
+        let old = obj.remove(k);
+        if k == "max_completion_tokens" && !obj.contains_key("max_tokens") {
+            if let Some(o) = old {
+                obj.insert("max_tokens".into(), o);
+            }
+        }
+    }
+    Some((Bytes::from(v.to_string()), names))
+}
+
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
@@ -376,9 +445,34 @@ pub async fn relay(
     let mut attempts: Vec<Value> = Vec::new();
     let mut last: Option<(u16, Option<header::HeaderValue>, Bytes)> = None;
     let ckey = pii::conv_key(o.headers, parsed.as_ref());
-    for (key, t) in ordered {
+    'targets: for (key, mut t) in ordered {
+        if t.max_input.is_some_and(|n| payload.len() > n) {
+            attempts.push(json!({"target": t.label, "error": "input too large"}));
+            continue;
+        }
+        if let Some(node) = &t.presence {
+            match st.presence.eligible(node, t.skip_busy) {
+                Ok(found) => {
+                    if t.base.is_empty() {
+                        t.base = found.unwrap_or_default();
+                    }
+                }
+                Err(why) => {
+                    attempts.push(json!({"target": t.label, "error": format!("presence: {why}")}));
+                    continue;
+                }
+            }
+            if t.base.is_empty() {
+                attempts.push(json!({"target": t.label, "error": "presence: no address"}));
+                continue;
+            }
+        }
+        let wait = t
+            .ttfb
+            .map(|s| ttfb.min(Duration::from_secs_f64(s)))
+            .unwrap_or(ttfb);
         let tier = if st.pii.enabled {
-            let spec = if t.base == st.upstream {
+            let spec = if !t.direct && t.base == st.upstream {
                 t.model.clone().unwrap_or_else(|| req_model.clone())
             } else {
                 t.label.clone()
@@ -434,29 +528,34 @@ pub async fn relay(
             t.base.trim_end_matches('/'),
             t.path.as_deref().unwrap_or(o.path)
         );
-        let rb = apply_headers(
-            st.client.post(&url).body(body),
-            o.headers,
-            &t,
-            o.translate.is_some(),
-            masking,
-        );
+        let mut body = body;
+        let mut dropped = false;
         let t0 = Instant::now();
-        let resp = match tokio::time::timeout(ttfb, rb.send()).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                st.mark_bad(&key, "connect", None);
-                attempts.push(json!({"target": t.label, "error": if e.is_timeout() { "timeout" } else { "connect" }}));
-                continue;
+        let resp = loop {
+            let rb = apply_headers(
+                st.client.post(&url).body(body.clone()),
+                o.headers,
+                &t,
+                o.translate.is_some(),
+                masking,
+            );
+            let resp = match tokio::time::timeout(wait, rb.send()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    st.mark_bad(&key, "connect", None);
+                    attempts.push(json!({"target": t.label, "error": if e.is_timeout() { "timeout" } else { "connect" }}));
+                    continue 'targets;
+                }
+                Err(_) => {
+                    st.mark_bad(&key, "timeout", None);
+                    attempts.push(json!({"target": t.label, "error": "timeout"}));
+                    continue 'targets;
+                }
+            };
+            let status = resp.status().as_u16();
+            if !(HARD.contains(&status) || SOFT.contains(&status)) {
+                break resp;
             }
-            Err(_) => {
-                st.mark_bad(&key, "timeout", None);
-                attempts.push(json!({"target": t.label, "error": "timeout"}));
-                continue;
-            }
-        };
-        let status = resp.status().as_u16();
-        if HARD.contains(&status) || SOFT.contains(&status) {
             let retry_after = resp
                 .headers()
                 .get("retry-after")
@@ -466,16 +565,23 @@ pub async fn relay(
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
             let data = resp.bytes().await.unwrap_or_default();
             let data = data.slice(..data.len().min(65_536));
-            // "model X is available via openai_chat, not anthropic_messages": wrong API shape for this
-            // target, not a sick provider - skip it without a cooldown.
+            if SOFT.contains(&status) && !dropped {
+                if let Some((nb, names)) = without_rejected_fields(&body, &data) {
+                    attempts.push(json!({"target": t.label, "status": status, "error": format!("retried without {}", names.join(", "))}));
+                    dropped = true;
+                    body = nb;
+                    continue;
+                }
+            }
             let wrong_shape = status == 404 && contains(&data, b"is available via");
             if HARD.contains(&status) && !wrong_shape {
                 st.mark_bad(&key, &status.to_string(), retry_after);
             }
             attempts.push(json!({"target": t.label, "status": status}));
             last = Some((status, ct, data));
-            continue;
-        }
+            continue 'targets;
+        };
+        let status = resp.status().as_u16();
         // Success.
         st.mark_good(&key, &t.label);
         let ms = t0.elapsed().as_millis() as u64;
@@ -685,4 +791,30 @@ fn raw_failed(
         format!("upstream {what} error")
     };
     json_response(code, &json!({"error": {"message": msg}}), &[])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drops_only_fields_the_error_names() {
+        let body = br#"{"model":"m","reasoning_effort":"low","seed":1,"max_completion_tokens":50}"#;
+        let (nb, names) =
+            without_rejected_fields(body, b"reasoning_effort is not enabled for this model")
+                .unwrap();
+        assert_eq!(names, ["reasoning_effort"]);
+        let v: Value = serde_json::from_slice(&nb).unwrap();
+        assert!(v.get("reasoning_effort").is_none());
+        assert_eq!(v["seed"], 1);
+        let (nb, _) = without_rejected_fields(
+            body,
+            br#"{"loc":["body","max_completion_tokens"],"msg":"Extra inputs are not permitted"}"#,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_slice(&nb).unwrap();
+        assert_eq!(v["max_tokens"], 50);
+        assert!(without_rejected_fields(body, b"bad param for this model").is_none());
+        assert!(without_rejected_fields(b"not json", b"reasoning_effort").is_none());
+    }
 }

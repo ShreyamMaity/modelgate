@@ -73,9 +73,33 @@ fn upstream_target(st: &AppState, spec: Option<&str>) -> Target {
         label: spec.unwrap_or("upstream").to_owned(),
         base: st.upstream.clone(),
         model: spec.map(str::to_owned),
-        path: None,
-        bearer: None,
+        ..Default::default()
     }
+}
+
+fn resolve(st: &AppState, cfg: &Config, model: &str) -> Option<Vec<String>> {
+    let mut models = st.models();
+    models.extend(target_models(cfg));
+    chain::resolve(model, &cfg.chains, &models).or_else(|| {
+        let name = chain::bare(model);
+        cfg.target(name).map(|_| vec![name.to_owned()])
+    })
+}
+
+fn target_models(cfg: &Config) -> Vec<Value> {
+    cfg.targets
+        .iter()
+        .map(|t| {
+            let prov = t.label.split_once('/').map(|p| p.0).unwrap_or("direct");
+            let id = t.label.split_once('/').map(|p| p.1).unwrap_or(&t.label);
+            json!({
+                "id": id, "display_name": t.label, "object": "model", "owned_by": prov,
+                "supported_endpoints": ["/v1/chat/completions", "/v1/messages"],
+                "metadata": {"provider": {"id": prov, "name": "", "description": "", "requires_client_auth": false, "upstream": "direct"}},
+                "direct": true, "presence": t.presence,
+            })
+        })
+        .collect()
 }
 
 async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response<Body> {
@@ -156,6 +180,8 @@ fn status(st: &AppState, cfg: &Config) -> Response<Body> {
             "uptime_s": st.started.elapsed().as_secs(), "requests": s.requests, "failovers": s.failovers, "errors": s.errors,
             "served": s.served, "cooling_down": st.cooling(), "chains": cfg.root.get("chains"),
             "routes": cfg.routes.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), "upstream": st.upstream,
+            "targets": cfg.targets.iter().map(|t| json!({"name": t.label, "base": t.base, "model": t.model, "presence": t.presence})).collect::<Vec<_>>(),
+            "presence": st.presence.status(),
             "pii": st.pii.status(),
         }),
         &[],
@@ -178,6 +204,7 @@ fn models_list(st: &AppState, cfg: &Config) -> Value {
             })
         })
         .collect();
+    data.extend(target_models(cfg));
     for mut m in st.models() {
         // The gateway can serve any chat model to Anthropic-style clients.
         if let Some(eps) = m
@@ -307,15 +334,35 @@ fn restore(st: &AppState, h: &HeaderMap, raw: &Bytes) -> Response<Body> {
 }
 
 async fn test_one(st: Arc<AppState>, spec: String) -> Value {
-    let url = format!("{}/v1/chat/completions", st.upstream.trim_end_matches('/'));
-    let body = json!({"model": spec, "max_tokens": 8, "messages": [{"role": "user", "content": "say ok"}]});
+    let direct = st.config().target(&spec).map(Target::direct);
+    let (base, model, bearer) = match &direct {
+        Some(t) => {
+            let mut base = t.base.clone();
+            if let Some(node) = &t.presence {
+                match st.presence.eligible(node, t.skip_busy) {
+                    Ok(found) if base.is_empty() => base = found.unwrap_or_default(),
+                    Ok(_) => {}
+                    Err(why) => {
+                        return json!({"target": spec, "status": format!("skipped: {why}"), "ms": 0})
+                    }
+                }
+            }
+            (
+                base,
+                t.model.clone().unwrap_or_else(|| spec.clone()),
+                t.bearer.clone(),
+            )
+        }
+        None => (st.upstream.clone(), spec.clone(), None),
+    };
+    let url = format!("{}/v1/chat/completions", base.trim_end_matches('/'));
+    let body = json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "say ok"}]});
+    let mut rb = st.client.post(&url).json(&body);
+    if let Some(b) = bearer {
+        rb = rb.bearer_auth(b);
+    }
     let t0 = Instant::now();
-    let status = match tokio::time::timeout(
-        Duration::from_secs(25),
-        st.client.post(&url).json(&body).send(),
-    )
-    .await
-    {
+    let status = match tokio::time::timeout(Duration::from_secs(25), rb.send()).await {
         Ok(Ok(r)) => {
             let s = r.status().as_u16();
             let _ = r.bytes().await;
@@ -344,7 +391,8 @@ async fn test(st: &Arc<AppState>, cfg: &Config, h: &HeaderMap, raw: &Bytes) -> R
     let Some(entries) = entries else {
         return err(400, "entries must be a list of up to 60 strings");
     };
-    let models = st.models();
+    let mut models = st.models();
+    models.extend(target_models(cfg));
     let mut specs: Vec<String> = Vec::new();
     for e in &entries {
         for t in chain::expand(e, &cfg.chains, &models, 0) {
@@ -376,8 +424,13 @@ fn model_of(raw: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-fn targets_for(st: &AppState, list: &[String]) -> Vec<Target> {
-    list.iter().map(|s| upstream_target(st, Some(s))).collect()
+fn targets_for(st: &AppState, cfg: &Config, list: &[String]) -> Vec<Target> {
+    list.iter()
+        .map(|s| match cfg.target(s) {
+            Some(d) => Target::direct(d),
+            None => upstream_target(st, Some(s)),
+        })
+        .collect()
 }
 
 async fn text(
@@ -389,11 +442,11 @@ async fn text(
 ) -> Response<Body> {
     st.stats.lock().unwrap().requests += 1;
     let model = model_of(&raw);
-    match chain::resolve(&model, &cfg.chains, &st.models()) {
+    match resolve(st, cfg, &model) {
         Some(list) => {
             relay(
                 st,
-                targets_for(st, &list),
+                targets_for(st, cfg, &list),
                 raw,
                 Opts {
                     path,
@@ -434,7 +487,7 @@ async fn messages(st: &Arc<AppState>, cfg: &Config, h: &HeaderMap, raw: Bytes) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let chain_list = chain::resolve(&model, &cfg.chains, &st.models());
+    let chain_list = resolve(st, cfg, &model);
     if chain_list.is_none() && st.native_messages_ids().contains(&model) {
         return relay(
             st,
@@ -452,7 +505,7 @@ async fn messages(st: &Arc<AppState>, cfg: &Config, h: &HeaderMap, raw: Bytes) -
     let body = Bytes::from(shim::to_openai(&a, cfg.settings.max_tokens_cap).to_string());
     let (targets, kind) = match &chain_list {
         Some(list) => (
-            targets_for(st, list),
+            targets_for(st, cfg, list),
             format!("anthropic:chain:{}", chain::bare(&model)),
         ),
         None => (
@@ -486,20 +539,7 @@ async fn route(
     let Some((_, list)) = cfg.routes.iter().find(|(p, _)| p == path) else {
         return err(404, "no such route");
     };
-    let targets = list
-        .iter()
-        .map(|d| Target {
-            label: d.label.clone(),
-            base: d.base.clone(),
-            model: d.model.clone(),
-            path: d.path.clone(),
-            bearer: d
-                .key_env
-                .as_ref()
-                .and_then(|k| std::env::var(k).ok())
-                .filter(|k| !k.is_empty()),
-        })
-        .collect();
+    let targets = list.iter().map(Target::direct).collect();
     relay(
         st,
         targets,
