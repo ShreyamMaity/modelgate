@@ -1758,3 +1758,54 @@ async fn pii_address_surrogate_streams_back_intact() {
         );
     }
 }
+
+async fn ner_poison_mock(req: Request) -> Response<Body> {
+    let raw = to_bytes(req.into_body(), 1 << 22).await.unwrap();
+    let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    if v["texts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|t| t.as_str().unwrap_or("").contains("POISONBLOB"))
+    {
+        return jr(500, json!({"error": "window too long"}));
+    }
+    let r = Request::builder()
+        .method("POST")
+        .uri("/v1/ner")
+        .body(Body::from(raw))
+        .unwrap();
+    ner_mock(r).await
+}
+
+#[tokio::test]
+async fn pii_ner_one_bad_text_does_not_fail_the_request() {
+    let ner = serve(axum::Router::new().fallback(ner_poison_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echo/n9"]}, "pii": {"ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let blob = format!("POISONBLOB{}", "Zm9vYmFy".repeat(4000));
+    let text = format!("{NER_TEXT}\n\n{blob}\n\nKaveri Agro Foods again");
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", &text, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/n9");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], text);
+    assert_no_names(&received("echo/n9"));
+    let status: Value = h
+        .http
+        .get(format!("{}/_gateway/pii", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["status"]["ner"]["skipped_texts"], 1);
+    assert_eq!(status["status"]["ner"]["errors"], 0);
+    assert_eq!(status["status"]["blocked_attempts"], 0);
+}

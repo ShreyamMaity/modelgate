@@ -17,6 +17,9 @@ struct App {
     texts: AtomicU64,
     bytes: AtomicU64,
     busy_us: AtomicU64,
+    windows: AtomicU64,
+    failed_windows: AtomicU64,
+    skipped_words: AtomicU64,
     max_texts: usize,
 }
 
@@ -65,8 +68,20 @@ async fn ner(State(app): State<Arc<App>>, Json(req): Json<Req>) -> (StatusCode, 
     let res = tokio::task::spawn_blocking(move || a.model.predict(&req.texts)).await;
     let us = t0.elapsed().as_micros() as u64;
     match res {
-        Ok(Ok(spans)) => {
+        Ok(Ok((spans, stats))) => {
             app.requests.fetch_add(1, Ordering::Relaxed);
+            app.windows
+                .fetch_add(stats.windows as u64, Ordering::Relaxed);
+            app.failed_windows
+                .fetch_add(stats.failed_windows as u64, Ordering::Relaxed);
+            app.skipped_words
+                .fetch_add(stats.skipped_words as u64, Ordering::Relaxed);
+            if stats.failed_windows > 0 || stats.last_error.is_some() {
+                eprintln!(
+                    "{}",
+                    json!({"event": "window_errors", "windows": stats.windows, "failed_windows": stats.failed_windows, "error": stats.last_error.as_deref().map(|e| e.chars().take(200).collect::<String>())})
+                );
+            }
             app.texts.fetch_add(n, Ordering::Relaxed);
             app.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
             app.busy_us.fetch_add(us, Ordering::Relaxed);
@@ -82,7 +97,9 @@ async fn ner(State(app): State<Arc<App>>, Json(req): Json<Req>) -> (StatusCode, 
                 .collect();
             (
                 StatusCode::OK,
-                Json(json!({"spans": out, "ms": us as f64 / 1000.0})),
+                Json(
+                    json!({"spans": out, "ms": us as f64 / 1000.0, "windows": stats.windows, "failed_windows": stats.failed_windows, "skipped_words": stats.skipped_words}),
+                ),
             )
         }
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))),
@@ -103,6 +120,10 @@ async fn health(State(app): State<Arc<App>>) -> Json<Value> {
         "texts": app.texts.load(Ordering::Relaxed),
         "bytes": app.bytes.load(Ordering::Relaxed),
         "busy_ms": app.busy_us.load(Ordering::Relaxed) / 1000,
+        "max_tokens": app.model.max_tokens(),
+        "windows": app.windows.load(Ordering::Relaxed),
+        "failed_windows": app.failed_windows.load(Ordering::Relaxed),
+        "skipped_words": app.skipped_words.load(Ordering::Relaxed),
         "rss_kb": rss_kb(),
     }))
 }
@@ -189,13 +210,16 @@ async fn main() {
         thr,
     );
     let opts = model::Options {
+        max_tokens: std::env::var("NER_MAX_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         arena: env_num("NER_ARENA", 0) == 1,
         opt_level: env_num("NER_OPT", 3),
         prepack: env_num("NER_PREPACK", 1) == 1,
         threads: env_num("NER_THREADS", 2),
         window: env_num("NER_WINDOW", 160),
         overlap: env_num("NER_OVERLAP", 24),
-        batch: env_num("NER_BATCH", 4),
+        batch: env_num("NER_BATCH", 1),
         max_span_words: env_num("NER_MAX_SPAN_WORDS", 30),
     };
     let config = match std::env::var("NER_CONFIG").ok().filter(|p| !p.is_empty()) {
@@ -231,6 +255,9 @@ async fn main() {
         texts: AtomicU64::new(0),
         bytes: AtomicU64::new(0),
         busy_us: AtomicU64::new(0),
+        windows: AtomicU64::new(0),
+        failed_windows: AtomicU64::new(0),
+        skipped_words: AtomicU64::new(0),
         max_texts: env_num("NER_MAX_TEXTS", 4096),
     });
     let listen = env("LISTEN", "127.0.0.1:8090");
