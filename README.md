@@ -80,6 +80,8 @@ Groups can contain other groups and wildcards (nesting up to 4 levels, at most 4
 - **Order.** Healthy targets are always tried first; cooled-down ones remain a last resort. If every target fails, the last upstream error is returned as-is (reshaped as an Anthropic error for `/v1/messages`).
 - **Streams.** Once a stream has started it cannot switch providers — failover only applies before the first byte.
 
+
+**Optional fields a provider rejects.** When a target answers 400/422 and the error names an optional request field the body carries (`reasoning_effort`, `max_completion_tokens`, `parallel_tool_calls`, `seed`, `service_tier`, `stream_options`, ...), the same target is retried once without it (`max_completion_tokens` becomes `max_tokens`). Mixed chains then keep working when a client always sends a field only some providers accept. The activity page shows `retried without <field>`.
 ## Docker Deployment
 
 The image is built on every push to the default branch and pushed to [ghcr.io](https://ghcr.io) (multi-arch, amd64/arm64); versioned tags are published on `v*` releases.
@@ -134,9 +136,32 @@ One JSON file (`chains.json`, created on first run; re-read whenever it changes;
 | `max_tokens_cap` | `32768` | cap applied to `max_tokens` on `/v1/messages` requests |
 | `paid_providers` | `["aperture"]` | providers the UI marks "paid" |
 | `routes` | `{}` | non-text endpoints sent to direct upstreams, with the same failover |
+| `targets` | `{}` | named direct chat upstreams (your own boxes) usable as chain entries, see below |
 | `pii` | all targets `public` | trust tiers for the PII egress layer, see below |
 
 **Embeddings, images, audio.** Aperture only routes text generation. `routes` sends other endpoints straight to providers: keys are read from the environment variable named by `key_env`, never from the config file.
+
+**Your own machines in a chain.** `targets` names OpenAI-compatible servers that are not behind the upstream, for example a llama.cpp or MLX server on another box. A name works anywhere a `provider/model` does: in a group, in an ad-hoc `a|b` chain, alone as the `model`, and `local/*` expands to every target named `local/...`. They are listed in `/v1/models` and the config UI, and the UI's Test button calls them directly.
+
+```json
+"targets": {
+  "local/small": { "base": "http://10.0.0.5:8121", "model": "small-model", "timeout": 4 },
+  "local/big":   { "presence": "desk-pc", "model": "big-model", "timeout": 3, "skip_busy": false }
+},
+"chains": { "sub": ["local/small", "provider-a/small-model"] }
+```
+
+| Target key | Meaning |
+|---|---|
+| `base` | server URL (optional with `presence`: the address the presence hub reports is used) |
+| `model` | rewrites the request's `model` for this target |
+| `key_env` | env var holding a bearer key |
+| `timeout` | seconds to wait for this target's first byte (the lower of this and the global limit) |
+| `presence` | node name: the target is used only while the presence hub says `use_bonsai: true` for it; otherwise it is skipped at once, with no cooldown, and the activity page shows `presence: <reason>` |
+| `skip_busy` | with `presence`, also skip while the node reports its server busy |
+| `max_input_chars` | skip this target at once (no cooldown) when the request body is longer, for small local models whose prefill is slow |
+
+Presence comes from a hub that serves `GET /presence` as `{"nodes": {"<node>": {"use_bonsai": bool, "route": "bonsai", "reason": "...", "bonsai": {"host": "...", "port": 8081, "busy": bool}}}}`. Set `PRESENCE_URL` and the gateway polls `GET <url>/presence` every 1.5 s. A node that is gone, unknown, not serving, busy with other GPU work, or whose data is older than 5 s is skipped. `/_gateway/status` shows the cached view under `presence`. Put your own targets in the `local` PII tier (`"local": ["local/*"]`) so they receive raw data.
 
 **Everything else under `/v1`.** Any `/v1/*` request the gateway doesn't handle itself (not a chain, not a `route`) is forwarded to the upstream unchanged: same method, path, query string, body and headers, with the reply streamed back as it arrives. So `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/*` and friends work through the same base URL whenever the upstream serves them. Set `PASSTHROUGH=0` to answer 404 instead.
 
@@ -200,6 +225,10 @@ Vault format (see [`pii-vault.example.json`](pii-vault.example.json)):
 | `PII_VAULT` | unset | JSON file of exact values that are always masked; re-read when it changes |
 | `PII_TTL_SECS` | `21600` | how long a conversation's placeholder map is kept |
 | `PII_REHYDRATE_TOOLS` | on | `0` leaves placeholders in tool-call arguments |
+| `PRESENCE_URL` | unset | presence hub for targets with `presence`; unset means those targets are always skipped |
+| `PRESENCE_POLL_MS` | `1500` | how often the hub is polled |
+| `PRESENCE_MAX_AGE_MS` | `5000` | older presence data counts as absent |
+| `PRESENCE_TIMEOUT_MS` | `800` | per-poll timeout |
 
 The same options can be set as flags: `--config`, `--listen`, `--upstream`. `modelgate --help` for the full list.
 
@@ -214,6 +243,7 @@ src/
   chain.rs      # chain expansion, wildcards, nesting
   config.rs     # chains.json load/save, versioning, history
   state.rs      # runtime state: cooling_down, served, model list
+  presence.rs   # presence hub poller that gates targets on another machine
   pii/          # egress masking: detectors, vault, per-conversation maps, rehydration
 assets/
   config.html   # the /config UI (vanilla HTML/CSS/JS)

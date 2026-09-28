@@ -4,6 +4,7 @@
 pub mod chain;
 pub mod config;
 pub mod pii;
+pub mod presence;
 pub mod relay;
 pub mod server;
 pub mod shim;
