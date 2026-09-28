@@ -409,8 +409,15 @@ pub struct Hit {
     pub score: f32,
 }
 
+enum Call {
+    Down(String),
+    Bad(String),
+}
+
 #[derive(Default)]
 struct Stats {
+    bad_replies: u64,
+    skipped_texts: u64,
     calls: u64,
     texts: u64,
     bytes: u64,
@@ -574,6 +581,8 @@ impl Ner {
             "bytes": s.bytes,
             "ms": s.ms,
             "errors": s.errors,
+            "bad_replies": s.bad_replies,
+            "skipped_texts": s.skipped_texts,
             "cache_hits": s.hits,
             "cache_entries": self.cache.lock().unwrap().len(),
             "last_error": s.last_error,
@@ -585,6 +594,67 @@ impl Ner {
         s.errors += 1;
         s.last_error = Some(e.clone());
         e
+    }
+
+    fn note(&self, e: String) {
+        let mut s = self.stats.lock().unwrap();
+        s.bad_replies += 1;
+        s.last_error = Some(e);
+    }
+
+    async fn call(
+        &self,
+        client: &reqwest::Client,
+        endpoint: &str,
+        cfg: &NerConfig,
+        batch: &[&str],
+    ) -> Result<Vec<Arc<Vec<Hit>>>, Call> {
+        let resp = client
+            .post(endpoint)
+            .timeout(cfg.timeout)
+            .json(&json!({ "texts": batch }))
+            .send()
+            .await
+            .map_err(|e| Call::Down(format!("ner unavailable: {e}")))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(Call::Bad(format!("ner status {}", status.as_u16())));
+        }
+        let v: Value = resp
+            .json()
+            .await
+            .map_err(|e| Call::Bad(format!("ner bad reply: {e}")))?;
+        let lists = v
+            .get("spans")
+            .and_then(Value::as_array)
+            .filter(|a| a.len() == batch.len())
+            .ok_or_else(|| Call::Bad("ner reply shape".into()))?;
+        let mut out = Vec::with_capacity(batch.len());
+        for (t, list) in batch.iter().zip(lists) {
+            let mut hits = Vec::new();
+            for s in list.as_array().into_iter().flatten() {
+                let (Some(a), Some(b), Some(k)) = (
+                    s.get(0).and_then(Value::as_u64),
+                    s.get(1).and_then(Value::as_u64),
+                    s.get(2).and_then(Value::as_str),
+                ) else {
+                    return Err(Call::Bad("ner span shape".into()));
+                };
+                let (a, b) = (a as usize, b as usize);
+                if b > t.len() || a >= b || !t.is_char_boundary(a) || !t.is_char_boundary(b) {
+                    return Err(Call::Bad("ner span out of range".into()));
+                }
+                let score = s.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32;
+                hits.push(Hit {
+                    start: a,
+                    end: b,
+                    kind: k.to_ascii_uppercase(),
+                    score,
+                });
+            }
+            out.push(Arc::new(hits));
+        }
+        Ok(out)
     }
 
     pub async fn find(
@@ -639,49 +709,31 @@ impl Ner {
             }
             let batch = &miss[i..j];
             let t0 = Instant::now();
-            let resp = client
-                .post(&endpoint)
-                .timeout(cfg.timeout)
-                .json(&json!({"texts": batch}))
-                .send()
-                .await
-                .map_err(|e| self.fail(format!("ner unavailable: {e}")))?;
-            if !resp.status().is_success() {
-                return Err(self.fail(format!("ner status {}", resp.status().as_u16())));
-            }
-            let v: Value = resp
-                .json()
-                .await
-                .map_err(|e| self.fail(format!("ner bad reply: {e}")))?;
-            let lists = v
-                .get("spans")
-                .and_then(Value::as_array)
-                .filter(|a| a.len() == batch.len())
-                .ok_or_else(|| self.fail("ner reply shape".into()))?;
-            let mut fresh = Vec::with_capacity(batch.len());
-            for (t, list) in batch.iter().zip(lists) {
-                let mut hits = Vec::new();
-                for s in list.as_array().into_iter().flatten() {
-                    let (Some(a), Some(b), Some(k)) = (
-                        s.get(0).and_then(Value::as_u64),
-                        s.get(1).and_then(Value::as_u64),
-                        s.get(2).and_then(Value::as_str),
-                    ) else {
-                        return Err(self.fail("ner span shape".into()));
-                    };
-                    let (a, b) = (a as usize, b as usize);
-                    if b > t.len() || a >= b || !t.is_char_boundary(a) || !t.is_char_boundary(b) {
-                        return Err(self.fail("ner span out of range".into()));
+            let mut fresh: Vec<(u64, Arc<Vec<Hit>>)> = Vec::with_capacity(batch.len());
+            match self.call(client, &endpoint, cfg, batch).await {
+                Ok(lists) => {
+                    for (t, hits) in batch.iter().zip(lists) {
+                        fresh.push((hash(t), hits));
                     }
-                    let score = s.get(3).and_then(Value::as_f64).unwrap_or(1.0) as f32;
-                    hits.push(Hit {
-                        start: a,
-                        end: b,
-                        kind: k.to_ascii_uppercase(),
-                        score,
-                    });
                 }
-                fresh.push((hash(t), Arc::new(hits)));
+                Err(Call::Down(e)) => return Err(self.fail(e)),
+                Err(Call::Bad(e)) => {
+                    self.note(e);
+                    for t in batch {
+                        match self
+                            .call(client, &endpoint, cfg, std::slice::from_ref(t))
+                            .await
+                        {
+                            Ok(mut lists) => fresh.push((hash(t), lists.remove(0))),
+                            Err(Call::Down(e)) => return Err(self.fail(e)),
+                            Err(Call::Bad(e)) => {
+                                self.note(e);
+                                self.stats.lock().unwrap().skipped_texts += 1;
+                                crate::state::log("ner_text_skipped", json!({"bytes": t.len()}));
+                            }
+                        }
+                    }
+                }
             }
             {
                 let mut s = self.stats.lock().unwrap();
@@ -689,7 +741,6 @@ impl Ner {
                 s.texts += batch.len() as u64;
                 s.bytes += bytes as u64;
                 s.ms += t0.elapsed().as_millis() as u64;
-                s.last_error = None;
             }
             let mut cache = self.cache.lock().unwrap();
             if cache.len() + fresh.len() > self.cache_cap {
