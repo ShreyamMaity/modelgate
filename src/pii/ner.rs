@@ -316,6 +316,7 @@ pub struct NerConfig {
     pub kinds: HashSet<String>,
     pub min_score: f32,
     pub allow: HashSet<String>,
+    pub disable_groups: HashSet<String>,
     pub timeout: Duration,
     pub max_bytes: usize,
     pub batch_bytes: usize,
@@ -328,6 +329,7 @@ impl Default for NerConfig {
             kinds: NER_KINDS.iter().map(|s| (*s).to_owned()).collect(),
             min_score: 0.5,
             allow: BUILTIN_ALLOW.iter().map(|s| (*s).to_owned()).collect(),
+            disable_groups: HashSet::new(),
             timeout: Duration::from_secs(180),
             max_bytes: 256 << 10,
             batch_bytes: 48 << 10,
@@ -373,6 +375,14 @@ impl NerConfig {
                 }
             }
         }
+        if let Some(a) = v.get("disable_groups").and_then(Value::as_array) {
+            c.disable_groups = a
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|g| g.trim().to_owned())
+                .filter(|g| !g.is_empty())
+                .collect();
+        }
         if let Some(t) = v.get("timeout_ms").and_then(Value::as_u64) {
             c.timeout = Duration::from_millis(t.clamp(100, 600_000));
         }
@@ -386,6 +396,13 @@ impl NerConfig {
         self.url.is_some() && !self.kinds.is_empty()
     }
 
+    pub fn off_for(&self, model: &str) -> bool {
+        !self.disable_groups.is_empty()
+            && model
+                .split('|')
+                .any(|m| self.disable_groups.contains(m.trim()))
+    }
+
     pub fn summary(&self) -> Value {
         let mut kinds: Vec<&String> = self.kinds.iter().collect();
         kinds.sort();
@@ -395,6 +412,7 @@ impl NerConfig {
             "kinds": kinds,
             "min_score": self.min_score,
             "allow": self.allow.len(),
+            "disable_groups": self.disable_groups.iter().collect::<std::collections::BTreeSet<_>>(),
             "timeout_ms": self.timeout.as_millis() as u64,
             "max_bytes": self.max_bytes,
         })

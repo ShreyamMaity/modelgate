@@ -9,11 +9,115 @@ pub struct Rehydrate {
     pub tool_extra: HashMap<String, String>,
     pub tools: bool,
     pub names: Vec<(String, String)>,
+    xsrc: Vec<(String, String, String)>,
+    xreq: String,
     ac: OnceLock<Option<(AhoCorasick, usize)>>,
     fz: OnceLock<Fuzzy>,
+    xs: OnceLock<Option<Arc<Xs>>>,
 }
 
 type Fuzzy = (Vec<(String, usize)>, HashSet<String>);
+
+#[derive(Debug)]
+struct Xs {
+    ac: AhoCorasick,
+    raw: Vec<String>,
+    tails: Vec<Option<Arc<HashSet<String>>>>,
+    sorted: Vec<String>,
+    max: usize,
+    skel: HashMap<String, String>,
+}
+
+const TOKEN_STOP: &[char] = &[
+    ',', ';', ':', '!', '?', '(', ')', '[', ']', '"', '\'', '\u{0964}', '\u{0965}',
+];
+
+fn next_token(rest: &str) -> Option<(usize, &str)> {
+    let sp = rest.len() - rest.trim_start_matches(' ').len();
+    if sp == 0 {
+        return None;
+    }
+    let body = &rest[sp..];
+    let n = body
+        .find(|c: char| c.is_whitespace() || TOKEN_STOP.contains(&c))
+        .unwrap_or(body.len());
+    Some((sp, &body[..n]))
+}
+
+fn absorb(s: &str, mut en: usize, tails: &HashSet<String>) -> usize {
+    while let Some((sp, tok)) = next_token(&s[en..]) {
+        if tok.is_empty() {
+            break;
+        }
+        let l = tok.to_ascii_lowercase();
+        let t = l.trim_end_matches('.');
+        let after = &s[en + sp + tok.len()..];
+        let last = after.is_empty() || after.starts_with('\n');
+        if tails.contains(&l) && !(last && t.len() < l.len() && tails.contains(t)) {
+            en += sp + tok.len();
+            continue;
+        }
+        if t.len() < l.len() && tails.contains(t) {
+            en += sp + t.len();
+        }
+        break;
+    }
+    en
+}
+
+const XS_SUFFIX: &[&str] = &[
+    "\u{09A6}\u{09C7}\u{09B0}",
+    "\u{09AF}\u{09BC}\u{09C7}\u{09B0}",
+    "\u{09DF}\u{09C7}\u{09B0}",
+    "\u{09C7}\u{09B0}",
+    "\u{0995}\u{09C7}",
+    "\u{09B0}",
+    "\u{09C7}",
+    "\u{0993}",
+    "\u{0987}",
+];
+
+type XsCache = std::sync::Mutex<HashMap<u64, Option<Arc<Xs>>>>;
+
+fn xs_cache() -> &'static XsCache {
+    static C: OnceLock<XsCache> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+fn indic_words(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut st: Option<usize> = None;
+    let mut prev: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        let w = super::xlit::is_indic(c) || super::xlit::is_mark(c);
+        if w {
+            if st.is_none() && !super::is_word(prev) {
+                st = Some(i);
+            }
+        } else if let Some(a) = st.take() {
+            if !super::is_word(Some(c)) {
+                out.push((a, i));
+            }
+        }
+        prev = Some(c);
+    }
+    if let Some(a) = st {
+        out.push((a, s.len()));
+    }
+    out
+}
+
+fn phrase_in(hay: &str, p: &str) -> bool {
+    let mut from = 0;
+    while let Some(i) = hay[from..].find(p) {
+        let s = from + i;
+        if super::bounded(hay, s, s + p.len()) {
+            return true;
+        }
+        from = s + p.len().max(1);
+    }
+    false
+}
 
 pub fn edit_distance(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.chars().collect();
@@ -165,13 +269,267 @@ impl Rehydrate {
             tool_extra,
             tools,
             names,
+            xsrc: Vec::new(),
+            xreq: String::new(),
             ac: OnceLock::new(),
             fz: OnceLock::new(),
+            xs: OnceLock::new(),
         }
     }
 
+    pub fn with_scripts(mut self, src: Vec<(String, String, String)>, req: String) -> Rehydrate {
+        self.xsrc = src;
+        self.xreq = req;
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && self.names.is_empty() && (self.tool_extra.is_empty() || !self.tools)
+        self.text.is_empty()
+            && self.names.is_empty()
+            && self.xsrc.is_empty()
+            && (self.tool_extra.is_empty() || !self.tools)
+    }
+
+    fn xs(&self) -> Option<&Xs> {
+        self.xs
+            .get_or_init(|| {
+                if self.xsrc.is_empty() {
+                    return None;
+                }
+                let mut src: Vec<&(String, String, String)> = self.xsrc.iter().collect();
+                src.sort();
+                let key = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    src.hash(&mut h);
+                    self.xreq.hash(&mut h);
+                    h.finish()
+                };
+                if let Some(x) = xs_cache().lock().unwrap().get(&key) {
+                    return x.clone();
+                }
+                let built = self.build_xs().map(Arc::new);
+                let mut c = xs_cache().lock().unwrap();
+                if c.len() >= 16 {
+                    c.clear();
+                }
+                c.insert(key, built.clone());
+                built
+            })
+            .as_deref()
+    }
+
+    fn build_xs(&self) -> Option<Xs> {
+        {
+            let own: HashSet<&str> = self.xsrc.iter().map(|x| x.0.as_str()).collect();
+            let mut map: HashMap<String, Option<String>> = HashMap::new();
+            let mut tails: HashMap<String, Arc<HashSet<String>>> = HashMap::new();
+            let mut skel: HashMap<String, Option<String>> = HashMap::new();
+            let req_skel: HashSet<String> = self
+                .xreq
+                .split(|c: char| !(super::xlit::is_indic(c) || super::xlit::is_mark(c)))
+                .filter_map(super::xlit::skeleton)
+                .collect();
+            for (sur, raw, kind) in &self.xsrc {
+                let multi = sur.split_whitespace().count() > 1;
+                if multi
+                    && matches!(kind.as_str(), "PERSON" | "NAME")
+                    && sur.split_whitespace().all(|w| own.contains(w))
+                {
+                    continue;
+                }
+                let prefix = (kind == "ORG").then(|| super::surrogate::org_head_len(sur));
+                let tail = prefix
+                    .filter(|k| *k < sur.split_whitespace().count())
+                    .map(|k| Arc::new(super::xlit::tail_tokens(sur, k)));
+                let head = sur.split_whitespace().next().unwrap_or("");
+                let single = !multi || prefix == Some(1);
+                if single {
+                    if let Some(f) = super::xlit::word(head) {
+                        for form in f.deva.iter().chain(&f.beng) {
+                            let Some(k) = super::xlit::skeleton(form) else {
+                                continue;
+                            };
+                            if req_skel.contains(&k) {
+                                continue;
+                            }
+                            match skel.get_mut(&k) {
+                                Some(slot) => {
+                                    if slot.as_deref() != Some(raw.as_str()) {
+                                        *slot = None;
+                                    }
+                                }
+                                None => {
+                                    skel.insert(k, Some(raw.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                for f in super::xlit::phrase_forms(sur, prefix).iter() {
+                    if !self.xreq.is_empty() && phrase_in(&self.xreq, f) {
+                        continue;
+                    }
+                    match map.get_mut(f) {
+                        Some(slot) => {
+                            if slot.as_deref() != Some(raw.as_str()) {
+                                *slot = None;
+                            }
+                        }
+                        None => {
+                            map.insert(f.clone(), Some(raw.clone()));
+                            if let Some(t) = &tail {
+                                tails.insert(f.clone(), t.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let mut pats: Vec<(String, String)> = map
+                .into_iter()
+                .filter_map(|(f, r)| r.map(|r| (f, r)))
+                .collect();
+            if pats.is_empty() {
+                return None;
+            }
+            pats.sort();
+            let max = pats.iter().map(|p| p.0.len()).max().unwrap_or(0);
+            let ac = AhoCorasickBuilder::new()
+                .match_kind(MatchKind::LeftmostLongest)
+                .ascii_case_insensitive(true)
+                .build(pats.iter().map(|p| p.0.as_str()))
+                .ok()?;
+            let mut sorted: Vec<String> = pats.iter().map(|p| p.0.to_ascii_lowercase()).collect();
+            sorted.sort();
+            Some(Xs {
+                ac,
+                tails: pats.iter().map(|p| tails.get(&p.0).cloned()).collect(),
+                raw: pats.into_iter().map(|p| p.1).collect(),
+                sorted,
+                max,
+                skel: skel
+                    .into_iter()
+                    .filter_map(|(k, r)| r.map(|r| (k, r)))
+                    .collect(),
+            })
+        }
+    }
+
+    fn xs_hits(&self, s: &str, hits: &mut Vec<(usize, usize, String)>) {
+        if self.xsrc.is_empty() || !super::xlit::has_indic(s) {
+            return;
+        }
+        let Some(x) = self.xs() else {
+            return;
+        };
+        let mut floor = 0;
+        for m in x.ac.find_iter(s) {
+            let (st, mut en) = (m.start(), m.end());
+            if st < floor || hits.iter().any(|h| st < h.1 && h.0 < en) {
+                continue;
+            }
+            if let Some(t) = &x.tails[m.pattern().as_usize()] {
+                en = absorb(s, en, t);
+            }
+            let before = s[..st].chars().next_back();
+            if super::is_word(before) && super::is_word(s[st..].chars().next()) {
+                continue;
+            }
+            let after = &s[en..];
+            let end_ok = !super::is_word(after.chars().next())
+                || (super::xlit::is_bengali(&s[st..en])
+                    && XS_SUFFIX.iter().any(|x| {
+                        after.starts_with(x) && !super::is_word(after[x.len()..].chars().next())
+                    }));
+            if end_ok {
+                hits.push((st, en, x.raw[m.pattern().as_usize()].clone()));
+                floor = en;
+            }
+        }
+        if x.skel.is_empty() {
+            return;
+        }
+        let mut extra = Vec::new();
+        for (st, en) in indic_words(s) {
+            if hits.iter().any(|h| st < h.1 && h.0 < en) {
+                continue;
+            }
+            let w = &s[st..en];
+            if super::xlit::is_stop(w) {
+                continue;
+            }
+            if let Some(r) = super::xlit::skeleton(w).and_then(|k| x.skel.get(&k)) {
+                extra.push((st, en, r.clone()));
+            }
+        }
+        hits.extend(extra);
+    }
+
+    fn xs_cut(&self, text: &str) -> usize {
+        if self.xsrc.is_empty() {
+            return text.len();
+        }
+        let mut lo = text.len().saturating_sub(1024);
+        while !text.is_char_boundary(lo) {
+            lo += 1;
+        }
+        if !super::xlit::has_indic(&text[lo..]) {
+            return text.len();
+        }
+        let Some(x) = self.xs() else {
+            return text.len();
+        };
+        let mut lo = text.len().saturating_sub(x.max + 1);
+        while !text.is_char_boundary(lo) {
+            lo += 1;
+        }
+        let mut wide = text.len().saturating_sub(x.max + 320);
+        while !text.is_char_boundary(wide) {
+            wide += 1;
+        }
+        let mut held = text.len();
+        for m in x.ac.find_iter(&text[wide..]) {
+            let Some(t) = &x.tails[m.pattern().as_usize()] else {
+                continue;
+            };
+            let (st, en) = (wide + m.start(), absorb(text, wide + m.end(), t));
+            let rest = &text[en..];
+            let open = rest.trim_start_matches(' ');
+            let pending = rest.trim_end_matches('.').is_empty()
+                || open.is_empty()
+                || (open.len() < rest.len()
+                    && !open.contains(char::is_whitespace)
+                    && t.iter().any(|w| w.starts_with(&open.to_ascii_lowercase())));
+            if pending {
+                held = held.min(st);
+            }
+        }
+        if held < text.len() {
+            return held;
+        }
+        let mut fz = text.len();
+        if !x.skel.is_empty() {
+            if let Some(&(st, en)) = indic_words(&text[lo..]).last() {
+                if lo + en == text.len() {
+                    fz = lo + st;
+                }
+            }
+        }
+        let mut prev = text[..lo].chars().next_back();
+        for (off, c) in text[lo..].char_indices() {
+            let i = lo + off;
+            let start = super::is_word(Some(c)) && !super::is_word(prev);
+            prev = Some(c);
+            if !start {
+                continue;
+            }
+            let tail = text[i..].to_ascii_lowercase();
+            let k = x.sorted.partition_point(|p| p.as_str() < tail.as_str());
+            if x.sorted.get(k).is_some_and(|p| p.starts_with(&tail)) {
+                return i.min(fz);
+            }
+        }
+        fz
     }
 
     fn names_ac(&self) -> Option<&(AhoCorasick, usize)> {
@@ -239,14 +597,20 @@ impl Rehydrate {
     }
 
     fn names_scan(&self, s: &str, escape: bool) -> Option<String> {
-        let (ac, _) = self.names_ac()?;
         let mut hits: Vec<(usize, usize, String)> = Vec::new();
-        for m in ac.find_iter(s) {
-            let (st, en) = (m.start(), m.end());
-            if super::bounded(s, st, en) {
-                let raw = &self.names[m.pattern().as_usize()].1;
-                hits.push((st, en, super::surrogate::apply_case(raw, &s[st..en])));
+        if let Some((ac, _)) = self.names_ac() {
+            for m in ac.find_iter(s) {
+                let (st, en) = (m.start(), m.end());
+                if super::bounded(s, st, en) {
+                    let raw = &self.names[m.pattern().as_usize()].1;
+                    hits.push((st, en, super::surrogate::apply_case(raw, &s[st..en])));
+                }
             }
+        }
+        let latin = hits.len();
+        self.xs_hits(s, &mut hits);
+        if hits.len() > latin {
+            hits.sort_by_key(|h| h.0);
         }
         if !self.fuzzy().0.is_empty() {
             let mut fz = Vec::new();
@@ -290,6 +654,10 @@ impl Rehydrate {
         if tool && !self.tools {
             return text.len();
         }
+        self.latin_cut(text).min(self.xs_cut(text))
+    }
+
+    fn latin_cut(&self, text: &str) -> usize {
         let Some((_, max)) = self.names_ac() else {
             return text.len();
         };
@@ -347,7 +715,10 @@ impl Rehydrate {
     }
 
     fn text_opt(&self, s: &str, tool: bool, escape: bool, names: bool) -> Option<String> {
-        let named = if names && !self.names.is_empty() && (!tool || self.tools) {
+        let named = if names
+            && (!self.names.is_empty() || !self.xsrc.is_empty())
+            && (!tool || self.tools)
+        {
             self.names_scan(s, escape)
         } else {
             None
@@ -938,6 +1309,75 @@ mod tests {
         }
     }
 
+    fn xnames(req: &str) -> Arc<Rehydrate> {
+        let src: Vec<(String, String, String)> = [
+            ("Chaitanya Bhandari", "Priya Venkataraman", "PERSON"),
+            ("Chaitanya", "Priya", "PERSON"),
+            ("Bhandari", "Venkataraman", "PERSON"),
+            ("Amberfort Agro Pvt Ltd", "Kaveri Agro Foods", "ORG"),
+            ("Nashik", "Kochi", "LOCATION"),
+        ]
+        .iter()
+        .map(|(a, b, c)| ((*a).into(), (*b).into(), (*c).into()))
+        .collect();
+        let names = src.iter().map(|x| (x.0.clone(), x.1.clone())).collect();
+        Arc::new(
+            Rehydrate::new(HashMap::new(), HashMap::new(), true, names)
+                .with_scripts(src, req.to_owned()),
+        )
+    }
+
+    #[test]
+    fn cross_script_surrogates() {
+        let r = xnames("");
+        let t = |s: &str| r.text(s, false, false);
+        assert_eq!(t("चैतन्य भंडारी ने कहा").unwrap(), "Priya Venkataraman ने कहा");
+        assert_eq!(t("चैतन्या भण्डारी ने कहा").unwrap(), "Priya Venkataraman ने कहा");
+        assert_eq!(t("चैतन्य जी आईं").unwrap(), "Priya जी आईं");
+        assert_eq!(t("চৈতন্য এসেছে").unwrap(), "Priya এসেছে");
+        assert_eq!(t("চৈতন্যের বাড়ি").unwrap(), "Priyaের বাড়ি");
+        assert_eq!(
+            t("एम्बरफोर्ट एग्रो प्राइवेट लिमिटेड में").unwrap(),
+            "Kaveri Agro Foods में"
+        );
+        assert_eq!(t("एम्बरफोर्ट Agro Pvt Ltd में").unwrap(), "Kaveri Agro Foods में");
+        assert_eq!(t("नाशिक से, Chaitanya").unwrap(), "Kochi से, Priya");
+        assert!(t("अचैतन्य और नाशिकों").is_none());
+        assert!(t("plain text only").is_none());
+        let seen = xnames("मैं कल नाशिक गया था");
+        assert!(seen.text("नाशिक से", false, false).is_none());
+        assert_eq!(seen.text("चैतन्य से", false, false).unwrap(), "Priya से");
+        assert_eq!(t("भन्डारि और चइतन्न्य").unwrap(), "Venkataraman और Priya");
+        assert_eq!(t("नासिक्क गए").unwrap(), "Kochi गए");
+        assert!(t("राम और श्याम आए").is_none());
+        assert!(seen.text("नशक", false, false).is_none());
+    }
+
+    #[test]
+    fn cross_script_stream_split_everywhere() {
+        let src = "कल चैतन्य भंडारी नाशिक गईं, এবং চৈতন্যের দল। एम्बर फोर्ट एग्रो प्रा. लि. को, एम्बरफोर्ट Agro Pvt. Ltd.";
+        let want = "कल Priya Venkataraman Kochi गईं, এবং Priyaের দল। Kaveri Agro Foods को, Kaveri Agro Foods.";
+        assert_eq!(xnames("").text(src, false, false).unwrap(), want);
+        for size in 1..12 {
+            let cs: Vec<char> = src.chars().collect();
+            let mut sse = String::new();
+            for c in cs.chunks(size) {
+                let piece: String = c.iter().collect();
+                sse.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"index": 0, "delta": {"content": piece}}]})
+                ));
+            }
+            sse.push_str(&format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            ));
+            let mut z = SseRehydrator::new(xnames(""));
+            let out = run(&mut z, &[&sse]);
+            assert_eq!(chat_text(&out).0, want, "chunk size {size}");
+        }
+    }
+
     #[test]
     fn text_and_escape() {
         let r = rh();
@@ -1193,5 +1633,69 @@ mod tests {
         }
         let v: Value = serde_json::from_str(&pj).unwrap();
         assert_eq!(v["k"], "FAKEKEY");
+    }
+}
+
+#[cfg(test)]
+mod xs_timing {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn xs_build_cost() {
+        let orgs = [
+            "Amberfort",
+            "Silverline",
+            "Bluebay",
+            "Sunpeak",
+            "Indigo Crest",
+            "Kingfisher Bay",
+            "Tamarind",
+            "Copperleaf",
+        ];
+        let tails = ["Agro Pvt Ltd", "Logistics LLP", "Infotech Pvt Ltd"];
+        let mut src = Vec::new();
+        for (i, o) in orgs.iter().enumerate() {
+            for t in tails {
+                src.push((
+                    format!("{o} {t}"),
+                    format!("Real Org {i} {t}"),
+                    "ORG".to_string(),
+                ));
+            }
+        }
+        for (i, n) in ["Riya", "Kabir", "Dasgupta", "Menon", "Rao"]
+            .iter()
+            .enumerate()
+        {
+            src.push((n.to_string(), format!("Real{i}"), "PERSON".to_string()));
+        }
+        for c in ["Nashik", "Agra", "Ranchi"] {
+            src.push((
+                c.to_string(),
+                "RealCity".to_string(),
+                "LOCATION".to_string(),
+            ));
+        }
+        let names = src.iter().map(|x| (x.0.clone(), x.1.clone())).collect();
+        let warm = Rehydrate::new(HashMap::new(), HashMap::new(), true, Vec::new())
+            .with_scripts(src.clone(), String::new());
+        let t = std::time::Instant::now();
+        warm.text("रिया", false, false);
+        println!("xs cold {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let r = Rehydrate::new(HashMap::new(), HashMap::new(), true, names)
+            .with_scripts(src, String::new());
+        let out = r.text("रिया और कबीर नाशिक में", false, false).unwrap();
+        println!(
+            "xs build+scan {:?} pats {} -> {out}",
+            t.elapsed(),
+            r.xs().unwrap().raw.len()
+        );
+        let t = std::time::Instant::now();
+        let again = Rehydrate::new(HashMap::new(), HashMap::new(), true, Vec::new())
+            .with_scripts(r.xsrc.clone(), String::new());
+        again.text("रिया", false, false);
+        println!("xs cached {:?}", t.elapsed());
     }
 }

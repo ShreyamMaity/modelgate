@@ -4,6 +4,7 @@ pub mod ner;
 pub mod rehydrate;
 pub mod surrogate;
 pub mod vault;
+pub mod xlit;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use axum::http::HeaderMap;
@@ -244,6 +245,7 @@ struct Conv {
     rev: HashMap<String, String>,
     sur: HashMap<String, String>,
     parts: HashMap<String, String>,
+    xkind: HashMap<String, String>,
     used: HashSet<String>,
     next: HashMap<String, u32>,
     seed: u64,
@@ -258,6 +260,7 @@ impl Conv {
             rev: HashMap::new(),
             sur: HashMap::new(),
             parts: HashMap::new(),
+            xkind: HashMap::new(),
             used: HashSet::new(),
             next: HashMap::new(),
             seed: u64::from_str_radix(&fnv(&[key]), 16).unwrap_or(7),
@@ -280,6 +283,8 @@ impl Conv {
         self.by_raw.retain(|_, (ph, _)| !gone.contains(ph));
         self.by_norm.retain(|_, ph| !gone.contains(ph));
         self.parts.retain(|_, p| !hit(p));
+        let sur = &self.sur;
+        self.xkind.retain(|s, _| sur.contains_key(s));
         self.used = self
             .sur
             .keys()
@@ -477,7 +482,7 @@ fn edit_strings(v: &mut Value, key: Option<&str>, f: &mut dyn FnMut(&str) -> Opt
 }
 
 fn is_word(c: Option<char>) -> bool {
-    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    c.is_some_and(|c| c.is_alphanumeric() || c == '_' || xlit::is_mark(c))
 }
 
 fn bounded(text: &str, s: usize, e: usize) -> bool {
@@ -739,6 +744,9 @@ impl Pii {
                     conv.sur
                         .entry(part.clone())
                         .or_insert_with(|| (*t).to_owned());
+                    conv.xkind
+                        .entry(part.clone())
+                        .or_insert_with(|| kind.to_owned());
                 }
                 out.push(part);
             }
@@ -762,6 +770,12 @@ impl Pii {
             .or_insert_with(|| raw.to_owned());
         conv.by_raw
             .insert(raw.to_owned(), (sur.clone(), kind.to_owned()));
+        if matches!(kind, "PERSON" | "NAME" | "ORG" | "LOCATION") {
+            xlit::prime(&sur);
+            conv.xkind
+                .entry(sur.clone())
+                .or_insert_with(|| kind.to_owned());
+        }
         Ok(sur)
     }
 
@@ -928,21 +942,36 @@ impl Pii {
         let mut err: Option<String> = None;
         let mut report = Report::default();
         let mut used: HashMap<String, String> = HashMap::new();
+        let cs_kind = |pid: usize| -> &str {
+            if pid < n_conv {
+                meta[pid].1.as_str()
+            } else {
+                vault.entries[vault_cs[pid - n_conv]].kind.as_str()
+            }
+        };
         let scan = |s: &str,
                     hits_ci: &mut Vec<(usize, usize, usize)>,
                     hits_cs: &mut Vec<(usize, usize, usize)>| {
+            let links = detect::link_spans(s);
+            let in_link = |st: usize, en: usize| links.iter().any(|l| l.0 <= st && en <= l.1);
             if let Some(ac) = &ac_ci {
                 for m in ac.find_iter(s) {
-                    if bounded(s, m.start(), m.end()) {
-                        hits_ci.push((m.start(), m.end(), m.pattern().as_usize()));
+                    let (st, en, pid) = (m.start(), m.end(), m.pattern().as_usize());
+                    if bounded(s, st, en)
+                        && !(detect::name_like(&ci_meta[pid].2) && in_link(st, en))
+                    {
+                        hits_ci.push((st, en, pid));
                     }
                 }
             }
             if let Some(ac) = &ac_cs {
                 for m in ac.find_iter(s) {
-                    let (st, en) = (m.start(), m.end());
-                    if !hits_ci.iter().any(|h| st < h.1 && h.0 < en) && bounded(s, st, en) {
-                        hits_cs.push((st, en, m.pattern().as_usize()));
+                    let (st, en, pid) = (m.start(), m.end(), m.pattern().as_usize());
+                    if !hits_ci.iter().any(|h| st < h.1 && h.0 < en)
+                        && bounded(s, st, en)
+                        && !(detect::name_like(cs_kind(pid)) && in_link(st, en))
+                    {
+                        hits_cs.push((st, en, pid));
                     }
                 }
             }
@@ -1049,6 +1078,17 @@ impl Pii {
                 tool_extra.insert(format!("<SECRET:{n}>"), e.value.clone());
             }
         }
+        let xsrc: Vec<(String, String, String)> = conv
+            .sur
+            .iter()
+            .filter_map(|(s, r)| conv.xkind.get(s).map(|k| (s.clone(), r.clone(), k.clone())))
+            .collect();
+        let xreq = if xsrc.is_empty() {
+            String::new()
+        } else {
+            let c = ctx.get_or_insert_with(|| Ctx::new(body, policy));
+            xlit::indic_runs(&c.text)
+        };
         let rh = Rehydrate::new(
             conv.rev.clone(),
             tool_extra,
@@ -1057,7 +1097,8 @@ impl Pii {
                 .iter()
                 .map(|(s, r)| (s.clone(), r.clone()))
                 .collect(),
-        );
+        )
+        .with_scripts(xsrc, xreq);
         drop(convs);
         if report.entities > 0 {
             let mut t = self.totals.lock().unwrap();
@@ -1103,6 +1144,13 @@ impl Pii {
         body: &Value,
     ) -> Result<Vec<ner::Found>, String> {
         if !policy.ner.enabled() || !tier.masks() {
+            return Ok(Vec::new());
+        }
+        if body
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|m| policy.ner.off_for(m))
+        {
             return Ok(Vec::new());
         }
         let allow = |k: &str| policy.allows(tier, k);
@@ -1325,6 +1373,101 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .to_owned()
+    }
+
+    #[test]
+    fn cross_script_surrogates_rehydrate_end_to_end() {
+        let p = pii();
+        let pol = Policy::default();
+        let f = found(&[
+            ("PERSON", "Priya Venkataraman"),
+            ("PERSON", "\u{092A}\u{094D}\u{0930}\u{093F}\u{092F}\u{093E}"),
+            ("LOCATION", "Kochi"),
+        ]);
+        let mut v = chat("Priya Venkataraman and \u{092A}\u{094D}\u{0930}\u{093F}\u{092F}\u{093E} live in Kochi.");
+        let (_, rh) = p.mask_with("x1", &mut v, Tier::Public, &pol, &f).unwrap();
+        let sur = |raw: &str| {
+            rh.names
+                .iter()
+                .find(|(_, r)| r == raw)
+                .map(|n| n.0.clone())
+                .unwrap()
+        };
+        let full = sur("Priya Venkataraman");
+        let mut ws = full.split(' ');
+        let (first, last) = (ws.next().unwrap(), ws.next().unwrap());
+        let fw = xlit::word(first).unwrap();
+        let lw = xlit::word(last).unwrap();
+        let reply = format!(
+            "{} {} \u{0915}\u{0947} \u{0938}\u{093E}\u{0925}",
+            fw.deva[0], lw.deva[0]
+        );
+        assert_eq!(
+            rh.text(&reply, false, false).unwrap(),
+            "Priya Venkataraman \u{0915}\u{0947} \u{0938}\u{093E}\u{0925}"
+        );
+        let mut miss = Vec::new();
+        for form in fw.deva.iter().chain(&fw.beng) {
+            let got = rh.text(&format!("{form} ?"), false, false);
+            if got.as_deref() != Some("Priya ?") {
+                miss.push(form.clone());
+            }
+        }
+        assert!(miss.len() <= 2, "{miss:?}");
+        let dev = sur("\u{092A}\u{094D}\u{0930}\u{093F}\u{092F}\u{093E}");
+        let dw = xlit::word(&dev).unwrap();
+        assert_eq!(
+            rh.text(&format!("{} !", dw.deva[0]), false, false).unwrap(),
+            "\u{092A}\u{094D}\u{0930}\u{093F}\u{092F}\u{093E} !"
+        );
+        let city = sur("Kochi");
+        let cw = xlit::word(&city).unwrap();
+        assert_eq!(
+            rh.text(&format!("{} {}", cw.deva[0], cw.beng[0]), false, false)
+                .unwrap(),
+            "Kochi Kochi"
+        );
+    }
+
+    #[test]
+    fn names_inside_links_stay_but_secrets_in_links_are_masked() {
+        let p = pii();
+        p.set_vault(Vault::from_value(&json!({"entries": [
+            {"kind": "name", "value": "Zorvek", "ignore_case": true},
+            {"kind": "org", "value": "Quillantic", "ignore_case": true},
+            {"kind": "handle", "value": "ZorvekDev"},
+            {"name": "deploy", "value": "FAKEDEPLOYSECRET42"}
+        ]})));
+        let text = "Zorvek here. See https://zorvek.dev/docs and *.zorvek.dev or api.quillantic.com:8443/v1, \
+                    github.com/ZorvekDev/repo, mail z.k@quillantic.com. Quillantic pays ZorvekDev. \
+                    postgres://zorvek:hunter2pass@db.zorvek.dev/app?token=FAKETOKENVALUE123456&k=FAKEDEPLOYSECRET42";
+        let mut v = chat(text);
+        let f = found(&[("PERSON", "Zorvek")]);
+        let (_, rh) = p
+            .mask_with("links", &mut v, Tier::Public, &Policy::default(), &f)
+            .unwrap();
+        let out = content(&v, 1);
+        for keep in [
+            "https://zorvek.dev/docs",
+            "*.zorvek.dev",
+            "api.quillantic.com:8443/v1",
+            "github.com/ZorvekDev/repo",
+            "@db.zorvek.dev/app?token=",
+        ] {
+            assert!(out.contains(keep), "{keep}: {out}");
+        }
+        for gone in [
+            "Zorvek here",
+            "Quillantic pays",
+            "pays ZorvekDev",
+            "hunter2pass",
+            "FAKETOKENVALUE123456",
+            "FAKEDEPLOYSECRET42",
+            "z.k@quillantic.com",
+        ] {
+            assert!(!out.contains(gone), "{gone}: {out}");
+        }
+        assert_eq!(rh.text(&out, false, false).unwrap(), text);
     }
 
     #[test]

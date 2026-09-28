@@ -14,7 +14,6 @@ const GIVEN: &[&str] = &[
     "Bhavya",
     "Chaitanya",
     "Charulata",
-    "Darshan",
     "Devika",
     "Dhruv",
     "Divyansh",
@@ -22,7 +21,6 @@ const GIVEN: &[&str] = &[
     "Gargi",
     "Gautam",
     "Hansika",
-    "Harsha",
     "Himani",
     "Ira",
     "Ishita",
@@ -40,12 +38,8 @@ const GIVEN: &[&str] = &[
     "Mihir",
     "Mridula",
     "Nakul",
-    "Namrata",
-    "Naveen",
     "Niharika",
     "Nikhita",
-    "Ojas",
-    "Paridhi",
     "Parth",
     "Pranjal",
     "Pratyush",
@@ -57,52 +51,39 @@ const GIVEN: &[&str] = &[
     "Riya",
     "Rudra",
     "Saanvi",
-    "Samarth",
     "Sanchita",
-    "Shaurya",
     "Shreya",
-    "Siddhi",
     "Soham",
-    "Srijan",
     "Tanishq",
     "Tanvi",
     "Tejas",
     "Trisha",
-    "Udit",
     "Urvashi",
-    "Vaibhav",
     "Vaidehi",
-    "Vedant",
     "Vihaan",
     "Vrinda",
     "Yamini",
-    "Yash",
     "Zoya",
     "Ayaan",
     "Aniket",
     "Bhargavi",
     "Debashree",
     "Farida",
-    "Gunjan",
     "Hrithik",
     "Indrani",
     "Jayant",
     "Kaustubh",
     "Lalitha",
     "Madhuri",
-    "Nirmal",
     "Omkar",
     "Pallabi",
     "Rituja",
     "Sameera",
     "Sharvari",
     "Sukanya",
-    "Tarun",
-    "Vasudha",
 ];
 
 const FAMILY: &[&str] = &[
-    "Acharya",
     "Ahluwalia",
     "Bajwa",
     "Banerjee",
@@ -127,11 +108,9 @@ const FAMILY: &[&str] = &[
     "Khanna",
     "Kulkarni",
     "Lahiri",
-    "Mahajan",
     "Malhotra",
     "Mathur",
     "Menon",
-    "Mitra",
     "Nadkarni",
     "Naidu",
     "Nambiar",
@@ -141,25 +120,20 @@ const FAMILY: &[&str] = &[
     "Parekh",
     "Patnaik",
     "Pillai",
-    "Purohit",
     "Rajan",
     "Rangarajan",
     "Rathore",
     "Sabharwal",
     "Sahni",
     "Saraf",
-    "Sarkar",
     "Sastry",
     "Sethi",
     "Shenoy",
     "Sinha",
     "Sodhi",
     "Subramaniam",
-    "Talwar",
     "Thakkar",
     "Trivedi",
-    "Upadhyay",
-    "Vaidya",
     "Venkatesan",
     "Wadhwa",
     "Bhandari",
@@ -238,7 +212,6 @@ const CITY: &[&str] = &[
     "Jalandhar",
     "Amritsar",
     "Rajkot",
-    "Surat",
     "Belagavi",
     "Hubballi",
     "Tiruchirappalli",
@@ -311,6 +284,25 @@ const BUILDING: &[&str] = &[
     "Palm Grove Apartments",
     "Sai Darshan Complex",
 ];
+
+pub fn pool_words() -> impl Iterator<Item = &'static str> {
+    GIVEN
+        .iter()
+        .chain(FAMILY)
+        .chain(CITY)
+        .chain(ORG_HEAD)
+        .chain(ORG_TAIL)
+        .flat_map(|w| w.split_whitespace())
+}
+
+pub fn org_head_len(sur: &str) -> usize {
+    ORG_HEAD
+        .iter()
+        .filter(|h| sur.len() > h.len() && sur.starts_with(*h) && sur.as_bytes()[h.len()] == b' ')
+        .map(|h| h.split_whitespace().count())
+        .max()
+        .unwrap_or(1)
+}
 
 pub fn is_surrogate_kind(kind: &str) -> bool {
     matches!(kind, "PERSON" | "NAME" | "ORG" | "LOCATION" | "ADDRESS")

@@ -1548,6 +1548,7 @@ const NER_FAKE: &[(&str, &str)] = &[
     ("Priya Venkataraman", "PERSON"),
     ("Kaveri Agro Foods", "ORG"),
     ("Koramangala", "LOCATION"),
+    ("FizzBuzz", "ORG"),
 ];
 
 async fn ner_mock(req: Request) -> Response<Body> {
@@ -1624,6 +1625,60 @@ async fn pii_ner_names_become_surrogates_and_come_back() {
     assert!(status["status"]["ner"]["calls"].as_u64().unwrap() >= 1);
     assert!(status["status"]["ner"]["cache_hits"].as_u64().unwrap() >= 1);
     assert!(!status.to_string().contains("Priya"));
+}
+
+#[tokio::test]
+async fn pii_ner_can_be_switched_off_per_group() {
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let pii = modelgate::pii::Pii::new(true, None);
+    pii.set_vault(modelgate::pii::vault::Vault::from_value(
+        &json!({"entries": [{"name": "code_key", "value": "FAKECODEKEY12345"}]}),
+    ));
+    let h = start_pii(
+        json!({"chains": {"luna-code": ["echo/g1"], "chat": ["echo/g2"]},
+               "pii": {"ner": {"url": ner, "disable_groups": ["luna-code"]}}}),
+        None,
+        pii,
+    )
+    .await;
+    let text = "Write fizz.py that prints FizzBuzz for Priya Venkataraman, key FAKECODEKEY12345, card 4111 1111 1111 1111";
+    let r = h
+        .post("/v1/chat/completions", user_chat("luna-code", text, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    let up = received("echo/g1");
+    assert!(
+        up[0].contains("FizzBuzz") && up[0].contains("Priya"),
+        "{}",
+        up[0]
+    );
+    assert!(up[0].contains("<SECRET:code_key>"), "{}", up[0]);
+    assert!(!up[0].contains("FAKECODEKEY12345") && !up[0].contains("4111 1111"));
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], text);
+    let r = h
+        .post("/v1/chat/completions", user_chat("chat", text, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    let up = received("echo/g2");
+    assert!(
+        !up[0].contains("FizzBuzz") && !up[0].contains("Priya"),
+        "{}",
+        up[0]
+    );
+    assert!(up[0].contains("<SECRET:code_key>"));
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], text);
+    let pii: Value = h
+        .http
+        .get(format!("{}/_gateway/pii", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(pii["policy"]["ner"]["disable_groups"], json!(["luna-code"]));
 }
 
 #[tokio::test]
