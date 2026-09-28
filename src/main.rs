@@ -17,6 +17,10 @@ Every option can also be set with an environment variable:
     ADMIN_TOKEN  if set, config changes need `Authorization: Bearer <token>`
     PASSTHROUGH  0 to answer 404 for /v1/* paths the gateway doesn't handle itself
                  (default: forward them to the upstream unchanged, e.g. /v1/embeddings)
+    PII_MODE     off to disable the PII egress layer   (default on: non-local targets get placeholders)
+    PII_VAULT    JSON file of known secrets/PII that are always masked (never sent raw to masked tiers)
+    PII_TTL_SECS how long a conversation's placeholder map is kept (default 21600)
+    PII_REHYDRATE_TOOLS  0 to leave placeholders in tool-call arguments instead of real values
 
 Docs: README.md    Config UI: http://<listen>/config    Activity: http://<listen>/_gateway/
 ";

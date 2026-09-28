@@ -92,6 +92,11 @@ async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response<Body>
         (&Method::GET, "/_gateway" | "/_gateway/") => html(DASHBOARD_HTML),
         (&Method::GET, "/_gateway/recent") => json_response(200, &st.recent_json(), &[]),
         (&Method::GET, "/_gateway/status") => status(&st, &cfg),
+        (&Method::GET, "/_gateway/pii") => json_response(
+            200,
+            &json!({"status": st.pii.status(), "policy": cfg.pii.summary(), "kinds": crate::pii::detect::KINDS}),
+            &[],
+        ),
         (&Method::GET, "/_gateway/config") => json_response(
             200,
             &json!({
@@ -151,6 +156,7 @@ fn status(st: &AppState, cfg: &Config) -> Response<Body> {
             "uptime_s": st.started.elapsed().as_secs(), "requests": s.requests, "failovers": s.failovers, "errors": s.errors,
             "served": s.served, "cooling_down": st.cooling(), "chains": cfg.root.get("chains"),
             "routes": cfg.routes.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), "upstream": st.upstream,
+            "pii": st.pii.status(),
         }),
         &[],
     )

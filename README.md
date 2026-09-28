@@ -134,10 +134,58 @@ One JSON file (`chains.json`, created on first run; re-read whenever it changes;
 | `max_tokens_cap` | `32768` | cap applied to `max_tokens` on `/v1/messages` requests |
 | `paid_providers` | `["aperture"]` | providers the UI marks "paid" |
 | `routes` | `{}` | non-text endpoints sent to direct upstreams, with the same failover |
+| `pii` | all targets `public` | trust tiers for the PII egress layer, see below |
 
 **Embeddings, images, audio.** Aperture only routes text generation. `routes` sends other endpoints straight to providers: keys are read from the environment variable named by `key_env`, never from the config file.
 
 **Everything else under `/v1`.** Any `/v1/*` request the gateway doesn't handle itself (not a chain, not a `route`) is forwarded to the upstream unchanged: same method, path, query string, body and headers, with the reply streamed back as it arrives. So `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/*` and friends work through the same base URL whenever the upstream serves them. Set `PASSTHROUGH=0` to answer 404 instead.
+
+## PII egress layer
+
+Every outgoing attempt is checked against the trust tier of the target it is about to try. A chain that fails over from a model on your own machine to a hosted one masks the hosted attempt, even inside the same request.
+
+| Tier | Gets | Use for |
+|---|---|---|
+| `local` | raw request | models on hardware you own |
+| `trusted_raw` | raw request | first-party APIs you trust with everything |
+| `trusted_masked` | placeholders (optionally only for some kinds) | first-party APIs you trust with some things |
+| `public` (default) | placeholders for every detected kind | everything else |
+
+```json
+"pii": {
+  "default": "public",
+  "tiers": {
+    "local": ["my-box/*"],
+    "trusted_raw": [],
+    "trusted_masked": ["gemini/*", "anthropic-direct/*"]
+  },
+  "kinds": { "trusted_masked": ["CARD", "AADHAAR", "PAN", "BANK_ACCOUNT", "PASSWORD", "PIN", "PRIVATE_KEY"] },
+  "disable": []
+}
+```
+
+Patterns are globs matched against `provider/model` (a plain model id is resolved to its provider from the upstream model list; `routes` targets match on their `label`). The most specific pattern wins; on a tie the stricter tier wins.
+
+**What is detected:** payment cards (Luhn), Aadhaar (Verhoeff), PAN, IFSC, UPI ids, bank account numbers next to "A/c"/"account", phone numbers (+91 and international), emails, UPI/ATM PINs and CVVs, passwords after `password:`/`pwd=`/`password is`, credentials in URLs, JWTs, private key blocks, and API keys/tokens (Anthropic, OpenAI-style `sk-`, GitHub, AWS, Google, Slack, Stripe, Hugging Face, GitLab, Groq, npm, Tailscale, Telegram bot, `Bearer`, `api_key=`). Plus exact matches from a local vault file (`PII_VAULT`), for values no pattern can find: names, addresses, the password of a bank statement PDF. `GET /_gateway/pii` lists the kinds, the tiers and the vault size (never values).
+
+**Placeholders** are stable per conversation: `<CARD_A>`, `<EMAIL_B>`, `<PHONE_A>`, `<SECRET:maps_key>` for named vault entries. The conversation is identified by an `X-Conversation-Id` header (or Claude Code's `X-Claude-Code-Session-Id`), else by a hash of the system prompt and first user message. The map lives in memory only, for `PII_TTL_SECS`.
+
+**Replies are rehydrated** on the way back: buffered JSON, OpenAI chat SSE, Anthropic SSE and Responses API SSE, including placeholders split across chunks. Tool-call arguments are rehydrated too, JSON-escaped, so the agent that executes the tool gets the real value while the model only ever saw the placeholder. A model can only get placeholders that were issued in its own conversation rehydrated, plus named vault entries marked `"tool": true`. `PII_REHYDRATE_TOOLS=0` leaves tool arguments masked.
+
+**Fail closed:** if masking fails for a masked tier (vault file missing or unreadable, body not JSON, map full), that target is skipped and the next one is tried; nothing is sent raw. Non-JSON bodies on raw passthrough paths (multipart audio uploads) are not inspected.
+
+**Nothing raw is logged.** The activity page and logs show the tier and counts per kind only.
+
+Vault format (see [`pii-vault.example.json`](pii-vault.example.json)):
+
+```json
+{
+  "entries": [
+    { "name": "maps_key", "value": "FAKE-KEY-VALUE-0000", "tool": true },
+    { "kind": "NAME", "value": "Jane Example", "ignore_case": true }
+  ]
+}
+```
 
 ## Environment Variables
 
@@ -148,6 +196,10 @@ One JSON file (`chains.json`, created on first run; re-read whenever it changes;
 | `UPSTREAM` | config `upstream`, else `http://ai` | the gateway to forward to |
 | `ADMIN_TOKEN` | unset | if set, config changes need `Authorization: Bearer <token>` |
 | `PASSTHROUGH` | on | `0` answers 404 for unhandled `/v1/*` paths instead of forwarding them to the upstream |
+| `PII_MODE` | on | `off` sends every request unmodified |
+| `PII_VAULT` | unset | JSON file of exact values that are always masked; re-read when it changes |
+| `PII_TTL_SECS` | `21600` | how long a conversation's placeholder map is kept |
+| `PII_REHYDRATE_TOOLS` | on | `0` leaves placeholders in tool-call arguments |
 
 The same options can be set as flags: `--config`, `--listen`, `--upstream`. `modelgate --help` for the full list.
 
@@ -162,6 +214,7 @@ src/
   chain.rs      # chain expansion, wildcards, nesting
   config.rs     # chains.json load/save, versioning, history
   state.rs      # runtime state: cooling_down, served, model list
+  pii/          # egress masking: detectors, vault, per-conversation maps, rehydration
 assets/
   config.html   # the /config UI (vanilla HTML/CSS/JS)
   dashboard.html
@@ -176,6 +229,7 @@ tests/
 - The UI can spend tokens (`Test entries`) and change your routing. **Set `ADMIN_TOKEN`** if anyone else can reach the port — writes then need `Authorization: Bearer <token>` (the UI asks once per browser session). Reads and inference are not authenticated; keep the port on the tailnet.
 - Config writes refuse cross-origin requests, so a web page can't drive your gateway through your browser.
 - Client credentials (`x-api-key`, `Authorization`, `anthropic-*`) are dropped when translating `/v1/messages`; the upstream identity is the tailnet node.
+- The PII layer is pattern based. It will miss free-form personal data (a name or address it has not been told about); put those in the vault. Tool-call rehydration means a hosted model can make your agent run a tool with a real value it never saw, so keep tool permissions on the agent side tight.
 
 ## License
 

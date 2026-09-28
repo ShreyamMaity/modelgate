@@ -18,23 +18,24 @@ th{color:var(--mut);font-weight:500}code{font:12px ui-monospace,monospace}.bad{c
 <p id="meta">loading&hellip;</p>
 <p><a href="/config">Edit groups</a></p>
 <div class="wrap"><table>
-<thead><tr><th>time (UTC)<th>asked for<th>answered by<th>ms<th>tried<th>skipped</tr></thead>
+<thead><tr><th>time (UTC)<th>asked for<th>answered by<th>ms<th>tried<th>pii<th>skipped</tr></thead>
 <tbody id="rows"></tbody>
 </table></div>
 <script>
 "use strict";
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const pii = p => !p ? "" : esc(p.tier) + (p.masked ? " <b>masked " + p.masked + "</b>" + (p.kinds ? " <code>" + esc(Object.entries(p.kinds).map(([k, n]) => k + (n > 1 ? "x" + n : "")).join(" ")) + "</code>" : "") : "");
 async function tick() {
   try {
     const [r, s] = await Promise.all([fetch("/_gateway/recent").then(x => x.json()), fetch("/_gateway/status").then(x => x.json())]);
     const cd = Object.entries(s.cooling_down).map(([k, v]) => k.replace(/^\w+:/, "") + " (" + v.seconds_left + "s, " + v.last + ")");
     document.getElementById("meta").textContent = s.requests + " requests, " + s.failovers + " failovers, " + s.errors +
-      " exhausted, upstream " + s.upstream + (cd.length ? " - cooling down: " + cd.join(", ") : "");
+      " exhausted, upstream " + s.upstream + (s.pii ? ", pii " + (s.pii.enabled ? "on (" + s.pii.masked_entities + " masked, " + s.pii.blocked_attempts + " blocked)" : "off") : "") + (cd.length ? " - cooling down: " + cd.join(", ") : "");
     document.getElementById("rows").innerHTML = r.map(x =>
       "<tr><td>" + esc(x.time) + "<td><code>" + esc(x.requested) + "</code><td>" +
       (x.served_by ? "<code class=ok>" + esc(x.served_by) + "</code>" : "<b class=bad>all failed</b>") +
-      "<td>" + x.ms + "<td>" + x.attempts + "<td class=bad>" + esc((x.skipped || []).map(a => a.target + " " + (a.status || a.error)).join(", "))
-    ).join("") || "<tr><td colspan=6>no requests yet";
+      "<td>" + x.ms + "<td>" + x.attempts + "<td>" + pii(x.pii) + "<td class=bad>" + esc((x.skipped || []).map(a => a.target + " " + (a.status || a.error)).join(", "))
+    ).join("") || "<tr><td colspan=7>no requests yet";
   } catch (e) { document.getElementById("meta").textContent = "error: " + e; }
 }
 tick(); setInterval(tick, 3000);

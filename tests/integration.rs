@@ -74,11 +74,105 @@ async fn chat(model: &str, stream: bool) -> Response<Body> {
     }
 }
 
+static RECEIVED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+fn received(model: &str) -> Vec<String> {
+    RECEIVED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, _)| m == model)
+        .map(|(_, b)| b.clone())
+        .collect()
+}
+
+fn last_user(v: &Value) -> String {
+    let msgs = v["messages"].as_array().cloned().unwrap_or_default();
+    let m = msgs
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "user")
+        .cloned()
+        .unwrap_or(Value::Null);
+    match &m["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        _ => String::new(),
+    }
+}
+
+fn echo(model: &str, v: &Value) -> Response<Body> {
+    let text = last_user(v);
+    let stream = v["stream"] == true;
+    if model.starts_with("localfail") {
+        return jr(503, json!({"error": "local box asleep"}));
+    }
+    if model.starts_with("echotool") {
+        let mut args = json!({"text": text}).to_string();
+        if model.starts_with("echotoolgo") {
+            args = args.replace('<', "\\u003c").replace('>', "\\u003e");
+        }
+        if stream {
+            let cs: Vec<char> = args.chars().collect();
+            let mut chunks: Vec<Value> = cs
+                .chunks(4)
+                .enumerate()
+                .map(|(i, c)| {
+                    let piece: String = c.iter().collect();
+                    let mut tc = json!({"index": 0, "function": {"arguments": piece}});
+                    if i == 0 {
+                        tc["id"] = json!("call_1");
+                        tc["function"]["name"] = json!("Run");
+                    }
+                    json!({"choices": [{"index": 0, "delta": {"tool_calls": [tc]}}]})
+                })
+                .collect();
+            chunks.push(
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}),
+            );
+            return sse(chunks);
+        }
+        return jr(
+            200,
+            json!({"choices": [{"message": {"content": null, "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Run", "arguments": args}}]}, "finish_reason": "tool_calls"}]}),
+        );
+    }
+    if stream {
+        let cs: Vec<char> = text.chars().collect();
+        let mut chunks: Vec<Value> = cs
+            .chunks(3)
+            .map(|c| {
+                let piece: String = c.iter().collect();
+                json!({"choices": [{"index": 0, "delta": {"content": piece}}]})
+            })
+            .collect();
+        chunks.push(json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}));
+        return sse(chunks);
+    }
+    jr(
+        200,
+        json!({"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}),
+    )
+}
+
 async fn mock(req: Request) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let raw = to_bytes(body, 1 << 22).await.unwrap();
     let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
     let model = v["model"].as_str().unwrap_or("").to_owned();
+    RECEIVED
+        .lock()
+        .unwrap()
+        .push((model.clone(), String::from_utf8_lossy(&raw).into_owned()));
+    if parts.uri.path() == "/v1/chat/completions"
+        && (model.starts_with("echo") || model.starts_with("localfail"))
+    {
+        return echo(&model, &v);
+    }
     let hdr = |n: &str| {
         parts
             .headers
@@ -141,6 +235,7 @@ async fn mock(req: Request) -> Response<Body> {
                 .unwrap()
         }
         ("POST", "/v1/limited") => jr(429, json!({"error": {"message": "slow down"}})),
+        ("POST", "/v1/echoraw") => jr(200, v.clone()),
         _ => jr(404, json!({"error": "not found"})),
     }
 }
@@ -166,14 +261,19 @@ async fn serve(router: axum::Router) -> String {
     format!("http://{addr}")
 }
 
-async fn start(mut config: Value, token: Option<&str>) -> H {
+async fn start(config: Value, token: Option<&str>) -> H {
+    start_pii(config, token, modelgate::pii::Pii::new(true, None)).await
+}
+
+async fn start_pii(mut config: Value, token: Option<&str>, pii: modelgate::pii::Pii) -> H {
     let mock_url = serve(axum::Router::new().fallback(mock)).await;
     let dir = std::env::temp_dir().join(format!("modelgate-it-{}", fastrand::u64(..)));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("chains.json");
     config["ttfb_stream"] = config.get("ttfb_stream").cloned().unwrap_or(json!(20));
     std::fs::write(&path, config.to_string()).unwrap();
-    let st: Arc<AppState> = AppState::new(path, mock_url.clone(), token.map(str::to_owned));
+    let st: Arc<AppState> =
+        AppState::with_pii(path, mock_url.clone(), token.map(str::to_owned), pii);
     st.refresh_models().await;
     let base = serve(modelgate::server::router(st)).await;
     H {
@@ -850,4 +950,324 @@ async fn passthrough_streams_instead_of_buffering() {
 "
     );
     assert!(t0.elapsed() >= Duration::from_millis(1400));
+}
+
+const FAKE: &str = "card 4111 1111 1111 1111, mail jane.fake@example.com, phone +91 98765 43210, PAN ABCPE1234F, password: Hunter2!x";
+const FAKE_RAW: &[&str] = &[
+    "4111 1111 1111 1111",
+    "jane.fake@example.com",
+    "98765 43210",
+    "ABCPE1234F",
+    "Hunter2!x",
+];
+
+fn assert_masked(bodies: &[String]) {
+    assert!(!bodies.is_empty(), "upstream got nothing");
+    for b in bodies {
+        for raw in FAKE_RAW {
+            assert!(!b.contains(raw), "upstream saw raw {raw:?}: {b}");
+        }
+        assert!(
+            b.contains("<CARD_A>") && b.contains("<EMAIL_A>") && b.contains("<PASSWORD_A>"),
+            "{b}"
+        );
+    }
+}
+
+fn user_chat(model: &str, text: &str, stream: bool) -> Value {
+    json!({"model": model, "stream": stream, "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": text}]})
+}
+
+async fn sse_text(r: reqwest::Response) -> (String, String) {
+    let body = r.text().await.unwrap();
+    let (mut t, mut a) = (String::new(), String::new());
+    for l in body.lines() {
+        let Some(d) = l.strip_prefix("data: ") else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<Value>(d) else {
+            continue;
+        };
+        for ch in v["choices"].as_array().into_iter().flatten() {
+            t.push_str(ch["delta"]["content"].as_str().unwrap_or(""));
+            for tc in ch["delta"]["tool_calls"].as_array().into_iter().flatten() {
+                a.push_str(tc["function"]["arguments"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    (t, a)
+}
+
+#[tokio::test]
+async fn pii_public_target_sees_placeholders_client_sees_values() {
+    let h = start(json!({"chains": {"c": ["echo/p1"]}}), None).await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=public; masked=5");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], FAKE);
+    assert_masked(&received("echo/p1"));
+    let recent: Value = h
+        .http
+        .get(format!("{}/_gateway/recent", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recent[0]["pii"]["masked"], 5);
+    assert_eq!(recent[0]["pii"]["tier"], "public");
+    for raw in FAKE_RAW {
+        assert!(
+            !recent.to_string().contains(raw),
+            "activity page must never show raw values"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pii_failover_from_local_to_public_masks_the_public_attempt() {
+    let h = start(
+        json!({"chains": {"c": ["localfail/q1", "echo/q1"]}, "pii": {"tiers": {"local": ["localfail/*"]}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/q1");
+    assert_eq!(hdr(&r, "x-gateway-attempts"), "2");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], FAKE);
+    let local = received("localfail/q1");
+    assert_eq!(local.len(), 1);
+    assert!(
+        local[0].contains("4111 1111 1111 1111"),
+        "local tier gets raw data"
+    );
+    assert_masked(&received("echo/q1"));
+}
+
+#[tokio::test]
+async fn pii_streaming_rehydrates_placeholders_split_across_chunks() {
+    let h = start(json!({"chains": {"c": ["echo/s1"]}}), None).await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, true))
+        .await;
+    assert_eq!(hdr(&r, "content-type"), "text/event-stream");
+    let (t, _) = sse_text(r).await;
+    assert_eq!(t, FAKE);
+    assert_masked(&received("echo/s1"));
+}
+
+#[tokio::test]
+async fn pii_tool_call_arguments_are_rehydrated() {
+    let pii = modelgate::pii::Pii::new(true, None);
+    pii.set_vault(modelgate::pii::vault::Vault::from_value(
+        &json!({"entries": [
+            {"name": "maps_key", "value": "FAKEMAPSKEY0000", "tool": true}
+        ]}),
+    ));
+    let h = start_pii(
+        json!({"chains": {"c": ["echotool/t1"], "d": ["echotool/t2"]}}),
+        None,
+        pii,
+    )
+    .await;
+    let text = format!("{FAKE} key FAKEMAPSKEY0000 \"quoted\"");
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", &text, false))
+        .await;
+    let v: Value = r.json().await.unwrap();
+    let args: Value = serde_json::from_str(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(args["text"], text);
+    let up = received("echotool/t1");
+    assert!(up[0].contains("<SECRET:maps_key>") && !up[0].contains("FAKEMAPSKEY0000"));
+    let r = h
+        .post("/v1/chat/completions", user_chat("d", &text, true))
+        .await;
+    let (_, a) = sse_text(r).await;
+    let args: Value = serde_json::from_str(&a).unwrap();
+    assert_eq!(args["text"], text);
+    assert_masked(&received("echotool/t2"));
+}
+
+#[tokio::test]
+async fn pii_anthropic_messages_are_masked_and_rehydrated() {
+    let h = start(json!({"chains": {"c": ["echo/a1"]}}), None).await;
+    let body = json!({"model": "c", "max_tokens": 50, "system": "sys", "messages": [{"role": "user", "content": FAKE}]});
+    let r = h.post("/v1/messages", body.clone()).await;
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["content"][0]["text"], FAKE);
+    let mut sb = body;
+    sb["stream"] = json!(true);
+    let r = h.post("/v1/messages", sb).await;
+    let txt = r.text().await.unwrap();
+    let mut out = String::new();
+    for l in txt.lines() {
+        if let Some(d) = l.strip_prefix("data: ") {
+            let v: Value = serde_json::from_str(d).unwrap();
+            out.push_str(v["delta"]["text"].as_str().unwrap_or(""));
+        }
+    }
+    assert_eq!(out, FAKE);
+    assert_masked(&received("echo/a1"));
+}
+
+#[tokio::test]
+async fn pii_consistent_placeholders_across_turns() {
+    let h = start(json!({"chains": {"c": ["echo/k1"]}}), None).await;
+    let first = user_chat("c", FAKE, false);
+    h.post("/v1/chat/completions", first.clone()).await;
+    let mut second = first;
+    second["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role": "assistant", "content": FAKE}));
+    second["messages"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"role": "user", "content": "again Hunter2!x and bob.fake@example.org"}));
+    let r = h.post("/v1/chat/completions", second).await;
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(
+        v["choices"][0]["message"]["content"],
+        "again Hunter2!x and bob.fake@example.org"
+    );
+    let bodies = received("echo/k1");
+    assert_eq!(bodies.len(), 2);
+    assert!(
+        bodies[1].contains("again <PASSWORD_A> and <EMAIL_B>"),
+        "{}",
+        bodies[1]
+    );
+}
+
+#[tokio::test]
+async fn pii_trusted_raw_and_off_send_raw() {
+    let h = start(
+        json!({"chains": {"c": ["echo/r1"]}, "pii": {"tiers": {"trusted_raw": ["echo/r1"]}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=trusted_raw; masked=0");
+    assert!(received("echo/r1")[0].contains("4111 1111 1111 1111"));
+    let off = start_pii(
+        json!({"chains": {"c": ["echo/r2"]}}),
+        None,
+        modelgate::pii::Pii::new(false, None),
+    )
+    .await;
+    let r = off
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-pii"), "");
+    assert!(received("echo/r2")[0].contains("4111 1111 1111 1111"));
+}
+
+#[tokio::test]
+async fn pii_fails_closed_and_skips_the_public_target() {
+    let missing = std::path::PathBuf::from("/nonexistent/modelgate-vault.json");
+    let h = start_pii(
+        json!({"chains": {"c": ["echo/f1"], "d": ["echo/f2", "echo/f2local"]}, "pii": {"tiers": {"local": ["echo/f2local"]}}}),
+        None,
+        modelgate::pii::Pii::new(true, Some(missing)),
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    assert_eq!(r.status(), 502);
+    assert!(
+        received("echo/f1").is_empty(),
+        "nothing may reach a public target"
+    );
+    let r = h
+        .post("/v1/chat/completions", user_chat("d", FAKE, false))
+        .await;
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/f2local");
+    assert!(received("echo/f2").is_empty());
+    let recent: Value = h
+        .http
+        .get(format!("{}/_gateway/recent", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recent[0]["skipped"][0]["error"], "pii-blocked");
+    let r = h
+        .post("/v1/echoraw", json!({"model": "m1", "input": FAKE}))
+        .await;
+    assert_eq!(r.status(), 502);
+}
+
+#[tokio::test]
+async fn pii_raw_passthrough_json_is_masked() {
+    let h = start(json!({"chains": {}}), None).await;
+    let r = h
+        .post("/v1/echoraw", json!({"model": "m1", "input": FAKE}))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=public; masked=5");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["input"], FAKE);
+    let up: Vec<String> = RECEIVED
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(m, b)| m == "m1" && b.contains("\"input\""))
+        .map(|x| x.1.clone())
+        .collect();
+    assert_masked(&up);
+}
+
+#[tokio::test]
+async fn pii_tool_args_with_go_style_escapes_are_rehydrated() {
+    let h = start(
+        json!({"chains": {"c": ["echotoolgo/g1"], "d": ["echotoolgo/g2"]}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", FAKE, false))
+        .await;
+    let v: Value = r.json().await.unwrap();
+    let args: Value = serde_json::from_str(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(args["text"], FAKE);
+    let r = h
+        .post("/v1/chat/completions", user_chat("d", FAKE, true))
+        .await;
+    let (_, a) = sse_text(r).await;
+    let args: Value = serde_json::from_str(&a).unwrap();
+    assert_eq!(args["text"], FAKE);
+    let body = json!({"model": "c", "max_tokens": 50, "stream": true, "messages": [{"role": "user", "content": FAKE}]});
+    let txt = h.post("/v1/messages", body).await.text().await.unwrap();
+    let mut pj = String::new();
+    for l in txt.lines() {
+        if let Some(d) = l.strip_prefix("data: ") {
+            let v: Value = serde_json::from_str(d).unwrap();
+            pj.push_str(v["delta"]["partial_json"].as_str().unwrap_or(""));
+        }
+    }
+    let args: Value = serde_json::from_str(&pj).unwrap();
+    assert_eq!(args["text"], FAKE);
+    assert_masked(&received("echotoolgo/g1"));
 }

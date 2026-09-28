@@ -1,0 +1,9 @@
+{
+  "entries": [
+    { "name": "maps_key", "value": "FAKE-MAPS-KEY-0000000000", "tool": true },
+    { "name": "statement_pdf_password", "value": "FAKEPDFPW1990", "tool": true },
+    { "kind": "NAME", "value": "Jane Example", "ignore_case": true },
+    { "kind": "ADDRESS", "value": "12 Example Street, Sample Nagar", "ignore_case": true },
+    { "kind": "CARD", "value": "4111 1111 1111 1111" }
+  ]
+}
