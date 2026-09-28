@@ -223,6 +223,7 @@ Addresses with an Indian PIN code are found by a built-in rule. For free-form na
     "kinds": ["PERSON", "ADDRESS", "ORG", "LOCATION"],
     "min_score": 0.5,
     "allow": ["MyProject", "MyBot"],
+    "disable_groups": ["my-code-group"],
     "timeout_ms": 180000,
     "max_bytes": 262144
   },
@@ -234,7 +235,13 @@ The sidecar reads `NER_MODEL` (ONNX file), `NER_TOKENIZER` (`tokenizer.json`), `
 
 `allow` lists words that are never masked (your own tool and project names); common AI and dev product names are allowed already. `PII_NER_URL` sets the URL when the config has none.
 
+`disable_groups` turns NER off for requests to those groups (for example a coding group, where identifiers like "FizzBuzz" must reach the model unchanged). Vault entries and the pattern detectors still mask those requests.
+
+Names, organisations, places and handles (from the vault or NER) are not masked inside URLs, hostnames and email addresses, so `https://yourname.dev` or `*.yourname.dev` reach the model intact. Secrets inside them, such as a URL password, a `?token=` value, a vault secret or a whole email address, are still masked.
+
 **Surrogates.** With `placeholder_style` `surrogate` (the default for `PERSON`, `NAME`, `ORG`, `LOCATION` and `ADDRESS`), names are replaced by realistic fake ones instead of `<PERSON_A>`: the model reads a normal sentence and keeps its grammar, which helps quality. Surrogates are stable per conversation and name part: "Priya Venkataraman" and a later "Priya" share the same fake first name. A surrogate is never a word already present in the conversation; if one later shows up as real text, it is replaced. On the way back surrogates are matched case-insensitively, as first or last name alone, with possessives ("Kavya's"), and across streamed chunks. Secrets, cards, keys and other shaped data always use tags. Set `"placeholder_style": "tag"` to use tags everywhere.
+
+If the model writes a surrogate name, place or organisation in Devanagari or Bengali script, it is still mapped back. Every surrogate word has a built-in transliteration with common spelling variants (inherent vowel dropped or kept, nukta, vowel length, anusvara, Bengali ya), and those forms are matched on the way back too, including across streamed chunks and with Bengali case endings. A single Indic word whose consonant skeleton (vowels, aspiration, doubling and similar sounds ignored, at least three consonants) equals a surrogate's is mapped back as well, which catches English-style respellings. A form that already appears in the request as real text is not used.
 
 ## Environment Variables
 

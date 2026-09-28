@@ -229,6 +229,38 @@ pub fn warm() {
     let _ = compiled();
 }
 
+const LINK: &str = concat!(
+    r#"(?i)\b[a-z][a-z0-9+.-]{1,15}://[^\s<>"'`]+"#,
+    r"|\b[a-z0-9._%+-]{1,64}@[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})*\.[a-z]{2,24}\b",
+    r"|(?:\*\.)?\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+",
+    r"(?:com|net|org|dev|io|ai|app|in|co|uk|us|me|xyz|info|biz|edu|gov|tech|cloud|site|online|sh|gg|tv|so|to|ly|page|blog|email|live|store|shop|pro|one|run|host|space|website|club|design|studio|systems|internal|local|lan|localhost)\b",
+    r#"(?::[0-9]{1,5})?(?:/[^\s<>"'`]*)?"#,
+);
+
+pub fn link_spans(s: &str) -> Vec<(usize, usize)> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    if !s.contains('.') {
+        return Vec::new();
+    }
+    let re = RE.get_or_init(|| {
+        RegexBuilder::new(LINK)
+            .unicode(false)
+            .dfa_size_limit(64 << 10)
+            .build()
+            .expect("link rule")
+    });
+    re.find_iter(s.as_bytes())
+        .map(|m| (m.start(), m.end()))
+        .collect()
+}
+
+pub fn name_like(kind: &str) -> bool {
+    matches!(
+        kind,
+        "PERSON" | "NAME" | "ORG" | "LOCATION" | "ADDRESS" | "HANDLE"
+    )
+}
+
 pub fn digits(s: &str) -> String {
     s.chars().filter(char::is_ascii_digit).collect()
 }
