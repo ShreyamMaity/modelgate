@@ -212,6 +212,30 @@ Vault format (see [`pii-vault.example.json`](pii-vault.example.json)):
 }
 ```
 
+### Names, addresses, organisations and places
+
+Addresses with an Indian PIN code are found by a built-in rule. For free-form names, organisations, places and addresses without a PIN, run the optional `pii-ner` sidecar ([`pii-ner/`](pii-ner)): a small Rust server that runs a token-classification or GLiNER ONNX model through ONNX Runtime and answers `POST /v1/ner`. modelgate only calls it for masked tiers (never for `local` or `trusted_raw`), caches results per paragraph, and fails closed: if the sidecar is down or too slow, masked targets are skipped and only raw-tier targets can serve the request.
+
+```json
+"pii": {
+  "ner": {
+    "url": "http://pii-ner:8090",
+    "kinds": ["PERSON", "ADDRESS", "ORG", "LOCATION"],
+    "min_score": 0.5,
+    "allow": ["MyProject", "MyBot"],
+    "timeout_ms": 180000,
+    "max_bytes": 262144
+  },
+  "placeholder_style": { "default": "surrogate", "ORG": "tag" }
+}
+```
+
+The sidecar reads `NER_MODEL` (ONNX file), `NER_TOKENIZER` (`tokenizer.json`), `NER_CONFIG` (`config.json`, for token-classification models), `NER_LABELS` (model label to kind, for example `PER:PERSON|ORG:ORG|LOC:LOCATION`, or GLiNER prompts such as `name:PERSON|location address:ADDRESS`), `NER_THREADS` (default 2) and `LISTEN` (default `127.0.0.1:8090`). `pii-ner bench` prints latency for 1 KB and 20 KB of text from `NER_BENCH_FILE` plus RSS.
+
+`allow` lists words that are never masked (your own tool and project names); common AI and dev product names are allowed already. `PII_NER_URL` sets the URL when the config has none.
+
+**Surrogates.** With `placeholder_style` `surrogate` (the default for `PERSON`, `NAME`, `ORG`, `LOCATION` and `ADDRESS`), names are replaced by realistic fake ones instead of `<PERSON_A>`: the model reads a normal sentence and keeps its grammar, which helps quality. Surrogates are stable per conversation and name part: "Priya Venkataraman" and a later "Priya" share the same fake first name. A surrogate is never a word already present in the conversation; if one later shows up as real text, it is replaced. On the way back surrogates are matched case-insensitively, as first or last name alone, with possessives ("Kavya's"), and across streamed chunks. Secrets, cards, keys and other shaped data always use tags. Set `"placeholder_style": "tag"` to use tags everywhere.
+
 ## Environment Variables
 
 | Variable | Default | Meaning |
@@ -225,6 +249,7 @@ Vault format (see [`pii-vault.example.json`](pii-vault.example.json)):
 | `PII_VAULT` | unset | JSON file of exact values that are always masked; re-read when it changes |
 | `PII_TTL_SECS` | `21600` | how long a conversation's placeholder map is kept |
 | `PII_REHYDRATE_TOOLS` | on | `0` leaves placeholders in tool-call arguments |
+| `PII_NER_URL` | unset | `pii-ner` sidecar used when `pii.ner.url` is not set |
 | `PRESENCE_URL` | unset | presence hub for targets with `presence`; unset means those targets are always skipped |
 | `PRESENCE_POLL_MS` | `1500` | how often the hub is polled |
 | `PRESENCE_MAX_AGE_MS` | `5000` | older presence data counts as absent |
@@ -251,6 +276,7 @@ assets/
 contrib/
   modelgate.service   # systemd unit
 chains.example.json
+pii-ner/        # optional NER sidecar (separate crate and image)
 tests/
 ```
 
@@ -259,7 +285,7 @@ tests/
 - The UI can spend tokens (`Test entries`) and change your routing. **Set `ADMIN_TOKEN`** if anyone else can reach the port — writes then need `Authorization: Bearer <token>` (the UI asks once per browser session). Reads and inference are not authenticated; keep the port on the tailnet.
 - Config writes refuse cross-origin requests, so a web page can't drive your gateway through your browser.
 - Client credentials (`x-api-key`, `Authorization`, `anthropic-*`) are dropped when translating `/v1/messages`; the upstream identity is the tailnet node.
-- The PII layer is pattern based. It will miss free-form personal data (a name or address it has not been told about); put those in the vault. Tool-call rehydration means a hosted model can make your agent run a tool with a real value it never saw, so keep tool permissions on the agent side tight.
+- Without the NER sidecar the PII layer is pattern based and will miss free-form personal data (a name it has not been told about); put those in the vault. With it, recall is high but not perfect: a lone first name in a short message can still slip through. Tool-call rehydration means a hosted model can make your agent run a tool with a real value it never saw, so keep tool permissions on the agent side tight.
 
 ## License
 

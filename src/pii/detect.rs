@@ -196,6 +196,7 @@ pub const KINDS: &[&str] = &[
     "PAN",
     "IFSC",
     "PHONE",
+    "ADDRESS",
 ];
 
 struct Compiled {
@@ -334,8 +335,46 @@ pub fn normalize(kind: &str, raw: &str) -> String {
             }
         }
         "EMAIL" | "UPI" => raw.to_ascii_lowercase(),
+        "PERSON" | "NAME" | "ORG" | "LOCATION" | "ADDRESS" => fold_name(raw),
         _ => raw.to_owned(),
     }
+}
+
+fn fold(c: char) -> char {
+    match c {
+        '\u{e0}'..='\u{e5}' | '\u{101}' | '\u{103}' | '\u{105}' => 'a',
+        '\u{e7}' | '\u{107}' | '\u{10d}' => 'c',
+        '\u{e8}'..='\u{eb}' | '\u{113}' | '\u{117}' | '\u{119}' => 'e',
+        '\u{ec}'..='\u{ef}' | '\u{12b}' | '\u{12f}' => 'i',
+        '\u{f1}' | '\u{144}' | '\u{1e45}' | '\u{1e47}' => 'n',
+        '\u{f2}'..='\u{f6}' | '\u{f8}' | '\u{14d}' | '\u{151}' => 'o',
+        '\u{f9}'..='\u{fc}' | '\u{16b}' | '\u{16f}' | '\u{171}' => 'u',
+        '\u{fd}' | '\u{ff}' => 'y',
+        '\u{15b}' | '\u{161}' | '\u{15f}' | '\u{1e63}' => 's',
+        '\u{1e6d}' => 't',
+        '\u{1e0d}' => 'd',
+        '\u{1e5b}' | '\u{1e5d}' => 'r',
+        '\u{1e25}' => 'h',
+        '\u{1e43}' => 'm',
+        _ => c,
+    }
+}
+
+pub fn fold_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut gap = false;
+    for c in raw.chars().flat_map(char::to_lowercase).map(fold) {
+        if c.is_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        } else {
+            gap = true;
+        }
+    }
+    out
 }
 
 fn overlaps(spans: &[Span], s: usize, e: usize) -> bool {
@@ -346,6 +385,9 @@ pub fn detect_into(text: &str, allow: &dyn Fn(&str) -> bool, spans: &mut Vec<Spa
     let c = compiled();
     let hits = c.set.matches(text.as_bytes());
     if !hits.matched_any() {
+        if allow("ADDRESS") {
+            addresses_into(text, spans);
+        }
         return;
     }
     for i in hits.iter() {
@@ -372,6 +414,24 @@ pub fn detect_into(text: &str, allow: &dyn Fn(&str) -> bool, spans: &mut Vec<Spa
                 start: s,
                 end: e,
                 kind: rule.kind,
+            });
+        }
+    }
+    if allow("ADDRESS") {
+        addresses_into(text, spans);
+    }
+}
+
+fn addresses_into(text: &str, spans: &mut Vec<Span>) {
+    if !text.bytes().any(|b| b.is_ascii_digit()) {
+        return;
+    }
+    for (s, e) in super::address::find(text) {
+        if !overlaps(spans, s, e) {
+            spans.push(Span {
+                start: s,
+                end: e,
+                kind: "ADDRESS",
             });
         }
     }

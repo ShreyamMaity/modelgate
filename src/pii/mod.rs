@@ -1,5 +1,8 @@
+pub mod address;
 pub mod detect;
+pub mod ner;
 pub mod rehydrate;
+pub mod surrogate;
 pub mod vault;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -52,6 +55,9 @@ pub struct Policy {
     rules: Vec<(String, Tier)>,
     kinds: HashMap<Tier, HashSet<String>>,
     disabled: HashSet<String>,
+    pub ner: ner::NerConfig,
+    style_default: bool,
+    style: HashMap<String, bool>,
 }
 
 impl Default for Policy {
@@ -61,7 +67,18 @@ impl Default for Policy {
             rules: Vec::new(),
             kinds: HashMap::new(),
             disabled: HashSet::new(),
+            ner: ner::NerConfig::from_value(None),
+            style_default: true,
+            style: HashMap::new(),
         }
+    }
+}
+
+fn style_flag(v: &Value) -> Option<bool> {
+    match v.as_str()?.to_ascii_lowercase().as_str() {
+        "surrogate" => Some(true),
+        "tag" => Some(false),
+        _ => None,
     }
 }
 
@@ -133,7 +150,31 @@ impl Policy {
             .into_iter()
             .map(|s| s.to_ascii_uppercase())
             .collect();
+        p.ner = ner::NerConfig::from_value(v.get("ner"));
+        match v.get("placeholder_style") {
+            Some(Value::Object(o)) => {
+                for (k, x) in o {
+                    if let Some(f) = style_flag(x) {
+                        if k.eq_ignore_ascii_case("default") {
+                            p.style_default = f;
+                        } else {
+                            p.style.insert(k.to_ascii_uppercase(), f);
+                        }
+                    }
+                }
+            }
+            Some(x) => {
+                if let Some(f) = style_flag(x) {
+                    p.style_default = f;
+                }
+            }
+            None => {}
+        }
         p
+    }
+
+    pub fn surrogate(&self, kind: &str) -> bool {
+        surrogate::is_surrogate_kind(kind) && *self.style.get(kind).unwrap_or(&self.style_default)
     }
 
     pub fn tier(&self, spec: &str) -> Tier {
@@ -162,11 +203,24 @@ impl Policy {
         for (pat, t) in &self.rules {
             tiers.entry(t.name()).or_default().push(pat);
         }
+        let styles: Map<String, Value> = ["PERSON", "NAME", "ORG", "LOCATION", "ADDRESS"]
+            .iter()
+            .map(|k| {
+                let st = if self.surrogate(k) {
+                    "surrogate"
+                } else {
+                    "tag"
+                };
+                ((*k).to_owned(), json!(st))
+            })
+            .collect();
         json!({
             "default": self.default.name(),
             "tiers": tiers,
             "kinds": self.kinds.iter().map(|(t, k)| (t.name().to_owned(), json!(k.iter().collect::<Vec<_>>()))).collect::<Map<_, _>>(),
             "disable": self.disabled.iter().collect::<Vec<_>>(),
+            "ner": self.ner.summary(),
+            "placeholder_style": styles,
         })
     }
 }
@@ -188,19 +242,93 @@ struct Conv {
     by_norm: HashMap<String, String>,
     by_raw: HashMap<String, (String, String)>,
     rev: HashMap<String, String>,
+    sur: HashMap<String, String>,
+    parts: HashMap<String, String>,
+    used: HashSet<String>,
     next: HashMap<String, u32>,
+    seed: u64,
     seen: Instant,
 }
 
 impl Conv {
-    fn new() -> Conv {
+    fn new(key: &str) -> Conv {
         Conv {
             by_norm: HashMap::new(),
             by_raw: HashMap::new(),
             rev: HashMap::new(),
+            sur: HashMap::new(),
+            parts: HashMap::new(),
+            used: HashSet::new(),
             next: HashMap::new(),
+            seed: u64::from_str_radix(&fnv(&[key]), 16).unwrap_or(7),
             seen: Instant::now(),
         }
+    }
+
+    fn retire(&mut self, word: &str) {
+        let hit = |s: &str| {
+            let l = s.to_lowercase();
+            l == word || l.split_whitespace().any(|w| w == word)
+        };
+        let gone: Vec<String> = self.sur.keys().filter(|s| hit(s)).cloned().collect();
+        if gone.is_empty() && !self.parts.values().any(|p| hit(p)) {
+            return;
+        }
+        for s in &gone {
+            self.sur.remove(s);
+        }
+        self.by_raw.retain(|_, (ph, _)| !gone.contains(ph));
+        self.by_norm.retain(|_, ph| !gone.contains(ph));
+        self.parts.retain(|_, p| !hit(p));
+        self.used = self
+            .sur
+            .keys()
+            .chain(self.parts.values())
+            .map(|s| s.to_lowercase())
+            .collect();
+    }
+}
+
+struct Ctx {
+    words: HashSet<String>,
+    text: String,
+    allow: HashSet<String>,
+}
+
+impl Ctx {
+    fn new(body: &Value, policy: &Policy) -> Ctx {
+        let mut words = HashSet::new();
+        let mut text = String::new();
+        visit_strings(body, None, &mut |s| {
+            let l = s.to_lowercase();
+            for w in l
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+            {
+                if !words.contains(w) {
+                    words.insert(w.to_owned());
+                }
+            }
+            text.push_str(&l);
+            text.push('\n');
+        });
+        Ctx {
+            words,
+            text,
+            allow: policy.ner.allow.clone(),
+        }
+    }
+
+    fn has_phrase(&self, p: &str) -> bool {
+        let mut from = 0;
+        while let Some(i) = self.text[from..].find(p) {
+            let s = from + i;
+            if bounded(&self.text, s, s + p.len()) {
+                return true;
+            }
+            from = s + p.len().max(1);
+        }
+        false
     }
 }
 
@@ -236,6 +364,7 @@ pub struct Pii {
     vault: Mutex<VaultSlot>,
     convs: Mutex<HashMap<String, Conv>>,
     pub totals: Mutex<Totals>,
+    pub ner: ner::Ner,
 }
 
 fn env_flag(name: &str, dflt: bool) -> bool {
@@ -449,6 +578,7 @@ impl Pii {
             vault: Mutex::new((None, Ok(Arc::new(Vault::default())))),
             convs: Mutex::new(HashMap::new()),
             totals: Mutex::new(Totals::default()),
+            ner: ner::Ner::default(),
         }
     }
 
@@ -521,6 +651,7 @@ impl Pii {
             "masked_requests": t.requests,
             "masked_entities": t.entities,
             "blocked_attempts": t.blocked,
+            "ner": self.ner.status(),
         })
     }
 
@@ -528,31 +659,120 @@ impl Pii {
         self.totals.lock().unwrap().blocked += 1;
     }
 
-    fn assign(&self, conv: &mut Conv, kind: &str, raw: &str) -> Result<String, String> {
+    fn assign(
+        &self,
+        conv: &mut Conv,
+        kind: &str,
+        raw: &str,
+        policy: &Policy,
+        ctx: &mut Option<Ctx>,
+        body: &Value,
+    ) -> Result<String, String> {
         if let Some((ph, _)) = conv.by_raw.get(raw) {
             return Ok(ph.clone());
         }
         let key = format!("{kind}\u{0}{}", detect::normalize(kind, raw));
-        let ph = match conv.by_norm.get(&key) {
-            Some(ph) => ph.clone(),
-            None => {
-                if conv.rev.len() >= self.max_entries {
-                    return Err("pii map full".into());
+        if let Some(ph) = conv.by_norm.get(&key).cloned() {
+            conv.by_raw
+                .insert(raw.to_owned(), (ph.clone(), kind.to_owned()));
+            return Ok(ph);
+        }
+        if conv.rev.len() + conv.sur.len() >= self.max_entries {
+            return Err("pii map full".into());
+        }
+        if !policy.surrogate(kind) {
+            let n = conv.next.entry(kind.to_owned()).or_insert(0);
+            let ph = format!("<{kind}_{}>", letters(*n));
+            *n += 1;
+            conv.by_norm.insert(key, ph.clone());
+            conv.rev.insert(ph.clone(), raw.to_owned());
+            conv.by_raw
+                .insert(raw.to_owned(), (ph.clone(), kind.to_owned()));
+            return Ok(ph);
+        }
+        let ctx = ctx.get_or_insert_with(|| Ctx::new(body, policy));
+        let h = u64::from_str_radix(&fnv(&[kind, &detect::normalize(kind, raw)]), 16).unwrap_or(1);
+        let seed = conv.seed ^ h;
+        let sur = if matches!(kind, "PERSON" | "NAME") {
+            let toks: Vec<&str> = raw.split_whitespace().collect();
+            let mut out: Vec<String> = Vec::with_capacity(toks.len());
+            for (i, t) in toks.iter().enumerate() {
+                let pk = detect::fold_name(t);
+                if pk.is_empty() {
+                    out.push((*t).to_owned());
+                    continue;
                 }
-                let n = conv.next.entry(kind.to_owned()).or_insert(0);
-                let ph = format!("<{kind}_{}>", letters(*n));
-                *n += 1;
-                conv.by_norm.insert(key, ph.clone());
-                conv.rev.insert(ph.clone(), raw.to_owned());
-                ph
+                let part = match conv.parts.get(&pk) {
+                    Some(p) => p.clone(),
+                    None => {
+                        let fam = i > 0;
+                        let n_pool = surrogate::pool_len(fam) * 3;
+                        let mut chosen = None;
+                        for n in 0..n_pool {
+                            let c = if fam {
+                                surrogate::family(seed ^ i as u64, n)
+                            } else {
+                                surrogate::given(seed, n)
+                            };
+                            let l = c.to_ascii_lowercase();
+                            if !conv.used.contains(&l)
+                                && !conv.parts.contains_key(&l)
+                                && !ctx.words.contains(&l)
+                                && !ctx.allow.contains(&l)
+                            {
+                                chosen = Some(c.to_owned());
+                                break;
+                            }
+                        }
+                        let c = chosen.ok_or("no free surrogate name")?;
+                        conv.used.insert(c.to_ascii_lowercase());
+                        conv.parts.insert(pk.clone(), c.clone());
+                        c
+                    }
+                };
+                if toks.len() > 1 && pk.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
+                    let pkey = format!("{kind}\u{0}{pk}");
+                    conv.by_norm.entry(pkey).or_insert_with(|| part.clone());
+                    conv.by_raw
+                        .entry((*t).to_owned())
+                        .or_insert_with(|| (part.clone(), kind.to_owned()));
+                    conv.sur
+                        .entry(part.clone())
+                        .or_insert_with(|| (*t).to_owned());
+                }
+                out.push(part);
             }
+            out.join(" ")
+        } else {
+            let mut chosen = None;
+            for n in 0..64 {
+                let c = surrogate::whole(kind, seed, n);
+                let l = c.to_lowercase();
+                if !conv.used.contains(&l) && !ctx.has_phrase(&l) && !conv.sur.contains_key(&c) {
+                    chosen = Some(c);
+                    break;
+                }
+            }
+            chosen.ok_or("no free surrogate")?
         };
+        conv.used.insert(sur.to_lowercase());
+        conv.by_norm.insert(key, sur.clone());
+        conv.sur
+            .entry(sur.clone())
+            .or_insert_with(|| raw.to_owned());
         conv.by_raw
-            .insert(raw.to_owned(), (ph.clone(), kind.to_owned()));
-        Ok(ph)
+            .insert(raw.to_owned(), (sur.clone(), kind.to_owned()));
+        Ok(sur)
     }
 
-    fn assign_vault(&self, conv: &mut Conv, e: &vault::Entry) -> Result<String, String> {
+    fn assign_vault(
+        &self,
+        conv: &mut Conv,
+        e: &vault::Entry,
+        policy: &Policy,
+        ctx: &mut Option<Ctx>,
+        body: &Value,
+    ) -> Result<String, String> {
         match &e.name {
             Some(n) => {
                 let ph = format!("<SECRET:{n}>");
@@ -561,7 +781,7 @@ impl Pii {
                     .or_insert_with(|| e.value.clone());
                 Ok(ph)
             }
-            None => self.assign(conv, &e.kind, &e.value),
+            None => self.assign(conv, &e.kind, &e.value, policy, ctx, body),
         }
     }
 
@@ -571,6 +791,17 @@ impl Pii {
         body: &mut Value,
         tier: Tier,
         policy: &Policy,
+    ) -> Result<(Report, Arc<Rehydrate>), String> {
+        self.mask_with(key, body, tier, policy, &[])
+    }
+
+    pub fn mask_with(
+        &self,
+        key: &str,
+        body: &mut Value,
+        tier: Tier,
+        policy: &Policy,
+        extra: &[ner::Found],
     ) -> Result<(Report, Arc<Rehydrate>), String> {
         if !body.is_object() {
             return Err("body is not a JSON object".into());
@@ -590,10 +821,12 @@ impl Pii {
                 convs.remove(&old);
             }
         }
-        let conv = convs.entry(key.to_owned()).or_insert_with(Conv::new);
+        let conv = convs
+            .entry(key.to_owned())
+            .or_insert_with(|| Conv::new(key));
         conv.seen = now;
 
-        let mut found: Vec<(&'static str, String)> = Vec::new();
+        let mut found: Vec<(String, String)> = Vec::new();
         let mut spans = Vec::new();
         visit_strings(body, None, &mut |s| {
             spans.clear();
@@ -601,27 +834,73 @@ impl Pii {
             for sp in &spans {
                 let raw = &s[sp.start..sp.end];
                 if !vault.exact.contains(raw) {
-                    found.push((sp.kind, raw.to_owned()));
+                    found.push((sp.kind.to_owned(), raw.to_owned()));
                 }
             }
         });
-        for (kind, raw) in &found {
-            self.assign(conv, kind, raw)?;
+        for f in extra {
+            if allow(&f.kind) && !vault.exact.contains(&f.raw) {
+                found.push((f.kind.clone(), f.raw.clone()));
+            }
+        }
+        let mut ctx: Option<Ctx> = None;
+        if !conv.sur.is_empty() {
+            let c = Ctx::new(body, policy);
+            let raw_words: HashSet<String> = conv
+                .by_raw
+                .keys()
+                .flat_map(|r| {
+                    r.to_lowercase()
+                        .split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut taint: Vec<String> = Vec::new();
+            for s in conv.sur.keys().chain(conv.parts.values()) {
+                let l = s.to_lowercase();
+                let words: Vec<&str> = l.split_whitespace().collect();
+                if words.len() == 1 {
+                    if c.words.contains(&l) && !raw_words.contains(&l) {
+                        taint.push(l.clone());
+                    }
+                } else if c.has_phrase(&l) {
+                    taint.push(l.clone());
+                }
+            }
+            for w in taint {
+                conv.retire(&w);
+            }
+            ctx = Some(c);
+        }
+        let mut long_first = found.clone();
+        long_first.sort_by_key(|(_, r)| std::cmp::Reverse(r.split_whitespace().count()));
+        for (kind, raw) in &long_first {
+            self.assign(conv, kind, raw, policy, &mut ctx, body)?;
         }
 
         let mut pats: Vec<String> = Vec::new();
-        let mut meta: Vec<(String, String)> = Vec::new();
+        let mut meta: Vec<(String, String, bool)> = Vec::new();
+        let mut ci_pats: Vec<String> = Vec::new();
+        let mut ci_meta: Vec<(Option<usize>, String, String, bool)> = Vec::new();
         for (raw, (ph, kind)) in &conv.by_raw {
-            if allow(kind) {
+            if !allow(kind) {
+                continue;
+            }
+            if policy.surrogate(kind) && !ph.starts_with('<') {
+                ci_pats.push(raw.clone());
+                ci_meta.push((None, ph.clone(), kind.clone(), true));
+            } else {
                 pats.push(raw.clone());
-                meta.push((ph.clone(), kind.clone()));
+                meta.push((ph.clone(), kind.clone(), false));
             }
         }
         let mut vault_cs: Vec<usize> = Vec::new();
-        let mut vault_ci: Vec<usize> = Vec::new();
         for (i, e) in vault.entries.iter().enumerate() {
             if e.ignore_case {
-                vault_ci.push(i);
+                ci_pats.push(e.value.clone());
+                ci_meta.push((Some(i), String::new(), e.kind.clone(), false));
             } else {
                 vault_cs.push(i);
             }
@@ -642,89 +921,123 @@ impl Pii {
                 .map_err(|e| e.to_string())
         };
         let ac_cs = build(&pats, false)?;
-        let ci_pats: Vec<String> = vault_ci
-            .iter()
-            .map(|i| vault.entries[*i].value.clone())
-            .collect();
         let ac_ci = build(&ci_pats, true)?;
 
         let mut vault_ph: HashMap<usize, String> = HashMap::new();
+        let mut pending: Vec<usize> = Vec::new();
         let mut err: Option<String> = None;
         let mut report = Report::default();
         let mut used: HashMap<String, String> = HashMap::new();
+        let scan = |s: &str,
+                    hits_ci: &mut Vec<(usize, usize, usize)>,
+                    hits_cs: &mut Vec<(usize, usize, usize)>| {
+            if let Some(ac) = &ac_ci {
+                for m in ac.find_iter(s) {
+                    if bounded(s, m.start(), m.end()) {
+                        hits_ci.push((m.start(), m.end(), m.pattern().as_usize()));
+                    }
+                }
+            }
+            if let Some(ac) = &ac_cs {
+                for m in ac.find_iter(s) {
+                    let (st, en) = (m.start(), m.end());
+                    if !hits_ci.iter().any(|h| st < h.1 && h.0 < en) && bounded(s, st, en) {
+                        hits_cs.push((st, en, m.pattern().as_usize()));
+                    }
+                }
+            }
+        };
+        visit_strings(body, None, &mut |s| {
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            scan(s, &mut a, &mut b);
+            for (_, _, pid) in a {
+                if let Some(i) = ci_meta[pid].0 {
+                    pending.push(i);
+                }
+            }
+            for (_, _, pid) in b {
+                if pid >= n_conv {
+                    pending.push(vault_cs[pid - n_conv]);
+                }
+            }
+        });
+        pending.sort_unstable();
+        pending.dedup();
+        for idx in pending {
+            match self.assign_vault(conv, &vault.entries[idx], policy, &mut ctx, body) {
+                Ok(p) => {
+                    vault_ph.insert(idx, p);
+                }
+                Err(e) => err = Some(e),
+            }
+        }
+        if let Some(e) = err {
+            return Err(e);
+        }
         if ac_cs.is_some() || ac_ci.is_some() {
             edit_strings(body, None, &mut |s| {
-                let mut hits: Vec<(usize, usize, String, String)> = Vec::new();
-                if let Some(ac) = &ac_ci {
-                    for m in ac.find_iter(s) {
-                        let idx = vault_ci[m.pattern().as_usize()];
-                        if !bounded(s, m.start(), m.end()) {
-                            continue;
-                        }
-                        let ph = match vault_ph.get(&idx) {
-                            Some(p) => p.clone(),
-                            None => match self.assign_vault(conv, &vault.entries[idx]) {
-                                Ok(p) => {
-                                    vault_ph.insert(idx, p.clone());
-                                    p
-                                }
-                                Err(e) => {
-                                    err = Some(e);
-                                    continue;
-                                }
-                            },
-                        };
-                        hits.push((m.start(), m.end(), ph, vault.entries[idx].kind.clone()));
-                    }
-                }
-                if let Some(ac) = &ac_cs {
-                    for m in ac.find_iter(s) {
-                        let (st, en) = (m.start(), m.end());
-                        if hits.iter().any(|h| st < h.1 && h.0 < en) || !bounded(s, st, en) {
-                            continue;
-                        }
-                        let pid = m.pattern().as_usize();
-                        let (ph, kind) = if pid < n_conv {
-                            meta[pid].clone()
-                        } else {
-                            let idx = vault_cs[pid - n_conv];
-                            let ph = match vault_ph.get(&idx) {
-                                Some(p) => p.clone(),
-                                None => match self.assign_vault(conv, &vault.entries[idx]) {
-                                    Ok(p) => {
-                                        vault_ph.insert(idx, p.clone());
-                                        p
-                                    }
-                                    Err(e) => {
-                                        err = Some(e);
-                                        continue;
-                                    }
-                                },
-                            };
-                            (ph, vault.entries[idx].kind.clone())
-                        };
-                        hits.push((st, en, ph, kind));
-                    }
-                }
-                if hits.is_empty() {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                scan(s, &mut a, &mut b);
+                if a.is_empty() && b.is_empty() {
                     return None;
+                }
+                let mut hits: Vec<(usize, usize, String, String)> = Vec::new();
+                for (st, en, pid) in a {
+                    let (vi, ph, kind, _) = &ci_meta[pid];
+                    let (ph, kind) = match vi {
+                        Some(i) => (
+                            vault_ph.get(i).cloned().unwrap_or_default(),
+                            vault.entries[*i].kind.clone(),
+                        ),
+                        None => (ph.clone(), kind.clone()),
+                    };
+                    if ph.is_empty() {
+                        continue;
+                    }
+                    let rep = if ph.starts_with('<') {
+                        ph.clone()
+                    } else {
+                        surrogate::apply_case(&ph, &s[st..en])
+                    };
+                    used.entry(ph).or_insert(kind.clone());
+                    hits.push((st, en, rep, kind));
+                }
+                for (st, en, pid) in b {
+                    let (ph, kind) = if pid < n_conv {
+                        (meta[pid].0.clone(), meta[pid].1.clone())
+                    } else {
+                        let idx = vault_cs[pid - n_conv];
+                        (
+                            vault_ph.get(&idx).cloned().unwrap_or_default(),
+                            vault.entries[idx].kind.clone(),
+                        )
+                    };
+                    if ph.is_empty() {
+                        continue;
+                    }
+                    let rep = if ph.starts_with('<') {
+                        ph.clone()
+                    } else {
+                        surrogate::apply_case(&ph, &s[st..en])
+                    };
+                    used.entry(ph).or_insert(kind.clone());
+                    hits.push((st, en, rep, kind));
                 }
                 hits.sort_by_key(|h| h.0);
                 let mut out = String::with_capacity(s.len());
                 let mut at = 0;
-                for (st, en, ph, kind) in hits {
+                for (st, en, rep, _) in hits {
+                    if st < at {
+                        continue;
+                    }
                     out.push_str(&s[at..st]);
-                    out.push_str(&ph);
+                    out.push_str(&rep);
                     at = en;
                     report.occurrences += 1;
-                    used.entry(ph).or_insert(kind);
                 }
                 out.push_str(&s[at..]);
                 Some(out)
             });
-        }
-        if let Some(e) = err {
-            return Err(e);
         }
         report.entities = used.len();
         for kind in used.values() {
@@ -736,11 +1049,15 @@ impl Pii {
                 tool_extra.insert(format!("<SECRET:{n}>"), e.value.clone());
             }
         }
-        let rh = Rehydrate {
-            text: conv.rev.clone(),
+        let rh = Rehydrate::new(
+            conv.rev.clone(),
             tool_extra,
-            tools: self.tool_rehydrate,
-        };
+            self.tool_rehydrate,
+            conv.sur
+                .iter()
+                .map(|(s, r)| (s.clone(), r.clone()))
+                .collect(),
+        );
         drop(convs);
         if report.entities > 0 {
             let mut t = self.totals.lock().unwrap();
@@ -748,6 +1065,55 @@ impl Pii {
             t.entities += report.entities as u64;
         }
         Ok((report, Arc::new(rh)))
+    }
+
+    pub fn ner_texts(body: &Value) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(o) = body.as_object() else {
+            return out;
+        };
+        for (k, v) in o {
+            if matches!(
+                k.as_str(),
+                "tools" | "functions" | "tool_choice" | "response_format" | "metadata" | "text"
+            ) {
+                continue;
+            }
+            if let (Some(items), "messages" | "input") = (v.as_array(), k.as_str()) {
+                for m in items {
+                    let role = m.get("role").and_then(Value::as_str).unwrap_or("");
+                    let ty = m.get("type").and_then(Value::as_str).unwrap_or("");
+                    if role == "assistant" || matches!(ty, "function_call" | "reasoning") {
+                        continue;
+                    }
+                    visit_strings(m, None, &mut |s| out.push(s.to_owned()));
+                }
+                continue;
+            }
+            visit_strings(v, Some(k), &mut |s| out.push(s.to_owned()));
+        }
+        out
+    }
+
+    pub async fn ner_find(
+        &self,
+        client: &reqwest::Client,
+        tier: Tier,
+        policy: &Policy,
+        body: &Value,
+    ) -> Result<Vec<ner::Found>, String> {
+        if !policy.ner.enabled() || !tier.masks() {
+            return Ok(Vec::new());
+        }
+        let allow = |k: &str| policy.allows(tier, k);
+        if !ner::NER_KINDS
+            .iter()
+            .any(|k| allow(k) && policy.ner.kinds.contains(*k))
+        {
+            return Ok(Vec::new());
+        }
+        let texts = Pii::ner_texts(body);
+        self.ner.find(client, &policy.ner, &allow, &texts).await
     }
 }
 
@@ -850,16 +1216,29 @@ mod tests {
             {"name": "maps key", "value": "FAKEMAPSKEY123", "tool": true},
             {"kind": "name", "value": "Jane Fakename", "ignore_case": true}
         ]})));
+        let tags = Policy::from_value(Some(&json!({"placeholder_style": "tag"})));
         let mut v = chat("use FAKEMAPSKEY123 for jane fakename and JANE FAKENAME");
-        let (r, rh) = p
-            .mask("v", &mut v, Tier::Public, &Policy::default())
-            .unwrap();
+        let (r, rh) = p.mask("v", &mut v, Tier::Public, &tags).unwrap();
         assert_eq!(
             v["messages"][1]["content"],
             "use <SECRET:mapskey> for <NAME_A> and <NAME_A>"
         );
         assert_eq!(r.entities, 2);
         assert_eq!(rh.text.get("<SECRET:mapskey>").unwrap(), "FAKEMAPSKEY123");
+        let mut v = chat("use FAKEMAPSKEY123 for jane fakename and JANE FAKENAME");
+        let (r, rh) = p
+            .mask("v2", &mut v, Tier::Public, &Policy::default())
+            .unwrap();
+        let out = v["messages"][1]["content"].as_str().unwrap().to_owned();
+        assert!(out.starts_with("use <SECRET:mapskey> for "), "{out}");
+        assert!(!out.to_lowercase().contains("fakename"), "{out}");
+        let (sur, raw) = rh.names.iter().find(|(_, r)| r == "Jane Fakename").unwrap();
+        assert_eq!(raw, "Jane Fakename");
+        assert!(
+            out.contains(&sur.to_lowercase()) && out.contains(&sur.to_uppercase()),
+            "{out}"
+        );
+        assert_eq!(r.entities, 2);
     }
 
     #[test]
@@ -930,6 +1309,210 @@ mod tests {
         p.mask("i", &mut v, Tier::Public, &Policy::default())
             .unwrap();
         assert_eq!(v, before);
+    }
+
+    fn found(list: &[(&str, &str)]) -> Vec<ner::Found> {
+        list.iter()
+            .map(|(k, r)| ner::Found {
+                kind: (*k).to_owned(),
+                raw: (*r).to_owned(),
+            })
+            .collect()
+    }
+
+    fn content(v: &Value, i: usize) -> String {
+        v["messages"][i]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned()
+    }
+
+    #[test]
+    fn ner_names_get_consistent_surrogates() {
+        let p = pii();
+        let pol = Policy::default();
+        let f = found(&[
+            ("PERSON", "Priya Venkataraman"),
+            ("ORG", "Kaveri Agro Foods"),
+        ]);
+        let mut v = chat("Priya Venkataraman from Kaveri Agro Foods called. priya's cat. PRIYA VENKATARAMAN, Priya.");
+        let (r, rh) = p.mask_with("n1", &mut v, Tier::Public, &pol, &f).unwrap();
+        let out = content(&v, 1);
+        let low = out.to_lowercase();
+        assert!(
+            !low.contains("priya") && !low.contains("venkataraman") && !low.contains("kaveri"),
+            "{out}"
+        );
+        let full = rh
+            .names
+            .iter()
+            .find(|(_, r)| r == "Priya Venkataraman")
+            .unwrap()
+            .0
+            .clone();
+        let first = full.split(' ').next().unwrap().to_owned();
+        assert!(out.starts_with(&format!("{full} from ")), "{out}");
+        assert!(
+            out.contains(&format!("{}'s cat", first.to_lowercase())),
+            "{out}"
+        );
+        assert!(out.contains(&full.to_uppercase()), "{out}");
+        assert!(out.ends_with(&format!("{first}.")), "{out}");
+        assert!(r.kinds.contains_key("PERSON") && r.kinds.contains_key("ORG"));
+        let mut again = chat("Priya Venkataraman from Kaveri Agro Foods called. priya's cat. PRIYA VENKATARAMAN, Priya.");
+        p.mask_with("n1", &mut again, Tier::Public, &pol, &f)
+            .unwrap();
+        assert_eq!(content(&again, 1), out, "stable across turns");
+        let reply = format!(
+            "{first}'s cat and {} met {}",
+            full.to_lowercase(),
+            full.to_uppercase()
+        );
+        assert_eq!(
+            rh.text(&reply, false, false).unwrap(),
+            "Priya's cat and priya venkataraman met PRIYA VENKATARAMAN"
+        );
+    }
+
+    #[test]
+    fn surrogates_never_collide_with_conversation_text() {
+        let pol = Policy::default();
+        let f = found(&[("PERSON", "Rahul Mehrotra")]);
+        let first_pick = {
+            let p = pii();
+            let mut v = chat("Rahul Mehrotra is here");
+            let (_, rh) = p.mask_with("same", &mut v, Tier::Public, &pol, &f).unwrap();
+            rh.names
+                .iter()
+                .find(|(_, r)| r == "Rahul Mehrotra")
+                .unwrap()
+                .0
+                .clone()
+        };
+        let taken: Vec<&str> = first_pick.split(' ').collect();
+        let p = pii();
+        let text = format!("Rahul Mehrotra is here with {} and {}", taken[0], taken[1]);
+        let mut v = chat(&text);
+        let (_, rh) = p.mask_with("same", &mut v, Tier::Public, &pol, &f).unwrap();
+        let sur = rh
+            .names
+            .iter()
+            .find(|(_, r)| r == "Rahul Mehrotra")
+            .unwrap()
+            .0
+            .clone();
+        for w in sur.split(' ') {
+            assert!(
+                !taken.contains(&w),
+                "{sur} reused a word already in the conversation"
+            );
+        }
+        let out = content(&v, 1);
+        assert!(
+            out.contains(&format!("with {} and {}", taken[0], taken[1])),
+            "{out}"
+        );
+        assert!(rh.names.iter().all(|(s, _)| !taken.contains(&s.as_str())));
+    }
+
+    #[test]
+    fn surrogate_retired_when_it_later_shows_up_as_real_text() {
+        let p = pii();
+        let pol = Policy::default();
+        let f = found(&[("PERSON", "Anjali Menon")]);
+        let mut v = chat("Anjali Menon joins");
+        let (_, rh) = p.mask_with("t", &mut v, Tier::Public, &pol, &f).unwrap();
+        let old = rh
+            .names
+            .iter()
+            .find(|(_, r)| r == "Anjali Menon")
+            .unwrap()
+            .0
+            .clone();
+        let old_first = old.split(' ').next().unwrap().to_owned();
+        let mut v = json!({"model": "x", "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "Anjali Menon joins"},
+            {"role": "user", "content": format!("also {old_first} is a real colleague")}]});
+        let (_, rh) = p.mask_with("t", &mut v, Tier::Public, &pol, &f).unwrap();
+        let new = rh
+            .names
+            .iter()
+            .find(|(_, r)| r == "Anjali Menon")
+            .unwrap()
+            .0
+            .clone();
+        assert_ne!(new, old);
+        assert!(!new.split(' ').any(|w| w == old_first));
+        assert!(content(&v, 2).contains(&format!("also {old_first} is")));
+        assert!(rh.names.iter().all(|(s, _)| s != &old && s != &old_first));
+    }
+
+    #[test]
+    fn tag_style_per_kind_and_secrets_stay_tags() {
+        let p = pii();
+        let pol = Policy::from_value(Some(
+            &json!({"placeholder_style": {"default": "surrogate", "PERSON": "tag", "CARD": "surrogate"}}),
+        ));
+        let f = found(&[("PERSON", "Sourav Ghoshal"), ("LOCATION", "Siliguri")]);
+        let mut v = chat("Sourav Ghoshal in Siliguri paid with 4111 1111 1111 1111");
+        let (_, rh) = p.mask_with("s", &mut v, Tier::Public, &pol, &f).unwrap();
+        let out = content(&v, 1);
+        assert!(out.starts_with("<PERSON_A> in "), "{out}");
+        assert!(out.ends_with("paid with <CARD_A>"), "{out}");
+        assert!(!out.contains("Siliguri"), "{out}");
+        assert_eq!(rh.names.len(), 1);
+        assert!(!pol.surrogate("CARD"));
+    }
+
+    #[test]
+    fn addresses_are_detected_without_ner() {
+        let p = pii();
+        let mut v = chat("Courier to Flat 302, Sai Krupa Apartments, 14th Cross, Indiranagar, Bengaluru 560038 today");
+        let (r, rh) = p
+            .mask("a", &mut v, Tier::Public, &Policy::default())
+            .unwrap();
+        let out = content(&v, 1);
+        assert!(
+            !out.contains("560038") && !out.contains("Sai Krupa"),
+            "{out}"
+        );
+        assert!(
+            out.starts_with("Courier to ") && out.ends_with(" today"),
+            "{out}"
+        );
+        assert_eq!(r.kinds.get("ADDRESS"), Some(&1));
+        let sur = rh.names[0].0.clone();
+        assert_eq!(
+            rh.text(&format!("Sent to {sur}."), false, false).unwrap(),
+            "Sent to Flat 302, Sai Krupa Apartments, 14th Cross, Indiranagar, Bengaluru 560038."
+        );
+    }
+
+    #[test]
+    fn ner_texts_skip_tool_schemas() {
+        let body = json!({"model": "m", "tools": [{"type": "function", "function": {"name": "f", "description": "Ask Priya Rao"}}],
+            "messages": [{"role": "user", "content": "hello Kiran Rao"}]});
+        assert_eq!(Pii::ner_texts(&body), vec!["hello Kiran Rao".to_owned()]);
+        let body = json!({"model": "m", "system": "You help Asha Rao", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {"role": "assistant", "content": "Kavya Menon said hi", "tool_calls": [{"id": "c", "type": "function", "function": {"name": "f", "arguments": "{\"to\":\"Kavya Menon\"}"}}]},
+            {"role": "tool", "tool_call_id": "c", "content": "sent to Kiran Rao"}]});
+        assert_eq!(
+            Pii::ner_texts(&body),
+            vec![
+                "You help Asha Rao".to_owned(),
+                "sent to Kiran Rao".to_owned()
+            ]
+        );
+        let resp = json!({"model": "m", "input": [
+            {"role": "user", "content": "from Asha Rao"},
+            {"type": "function_call", "call_id": "c", "arguments": "{\"q\":\"Kavya\"}"},
+            {"type": "function_call_output", "call_id": "c", "output": "Kiran Rao"}]});
+        assert_eq!(
+            Pii::ner_texts(&resp),
+            vec!["from Asha Rao".to_owned(), "Kiran Rao".to_owned()]
+        );
     }
 
     fn prompt_20kb() -> Value {
