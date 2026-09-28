@@ -222,6 +222,8 @@ Addresses with an Indian PIN code are found by a built-in rule. For free-form na
     "url": "http://pii-ner:8090",
     "kinds": ["PERSON", "ADDRESS", "ORG", "LOCATION"],
     "min_score": 0.5,
+    "org_min_score": 0.7,
+    "org_single_min_score": 0.85,
     "allow": ["MyProject", "MyBot"],
     "disable_groups": ["my-code-group"],
     "timeout_ms": 180000,
@@ -234,6 +236,8 @@ Addresses with an Indian PIN code are found by a built-in rule. For free-form na
 The sidecar reads `NER_MODEL` (ONNX file), `NER_TOKENIZER` (`tokenizer.json`), `NER_CONFIG` (`config.json`, for token-classification models), `NER_LABELS` (model label to kind, for example `PER:PERSON|ORG:ORG|LOC:LOCATION`, or GLiNER prompts such as `name:PERSON|location address:ADDRESS`), `NER_THREADS` (default 2) and `LISTEN` (default `127.0.0.1:8090`). `pii-ner bench` prints latency for 1 KB and 20 KB of text from `NER_BENCH_FILE` plus RSS.
 
 `allow` lists words that are never masked (your own tool and project names); common AI and dev product names are allowed already. `PII_NER_URL` sets the URL when the config has none.
+
+`min_score` is the minimum model confidence for a span. Organisations need more: `org_min_score`, and `org_single_min_score` for one-word organisations. A one-word span that is an ordinary English word is never masked: imperatives such as "Find", "Check" or "Send" at the start of a request, function words, and common words from a vendored frequency list ([`src/pii/common_words.txt`](src/pii/common_words.txt), built by [`contrib/common_words.py`](contrib/common_words.py) with first names removed). A one-word person name that is also an English word is kept when it is capitalised mid-sentence, and a place is kept when the word is also a proper noun (Goa, China). Leading imperatives are trimmed from longer spans, so "Find Kingfisher Bay Agro" masks only the organisation.
 
 `disable_groups` turns NER off for requests to those groups (for example a coding group, where identifiers like "FizzBuzz" must reach the model unchanged). Vault entries and the pattern detectors still mask those requests.
 

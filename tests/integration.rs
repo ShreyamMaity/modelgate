@@ -1864,3 +1864,73 @@ async fn pii_ner_one_bad_text_does_not_fail_the_request() {
     assert_eq!(status["status"]["ner"]["errors"], 0);
     assert_eq!(status["status"]["blocked_attempts"], 0);
 }
+
+const VERB_FAKE: &[(&str, &str, f64)] = &[
+    ("Find", "ORG", 0.97),
+    ("Check", "ORG", 0.93),
+    ("Send", "PERSON", 0.91),
+    ("Show", "ORG", 0.95),
+    ("Find My", "ORG", 0.56),
+    ("Kingfisher Bay Agro", "ORG", 0.99),
+    ("Priya", "PERSON", 0.88),
+    ("Acme", "ORG", 0.99),
+];
+
+async fn ner_verbs_mock(req: Request) -> Response<Body> {
+    let raw = to_bytes(req.into_body(), 1 << 22).await.unwrap();
+    let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    let mut spans = Vec::new();
+    for t in v["texts"].as_array().cloned().unwrap_or_default() {
+        let t = t.as_str().unwrap_or("").to_owned();
+        let mut list: Vec<Value> = Vec::new();
+        for (name, kind, score) in VERB_FAKE {
+            for (i, _) in t.match_indices(name) {
+                let end = i + name.len();
+                if t[end..].starts_with(|c: char| c.is_alphanumeric())
+                    || list.iter().any(|s| {
+                        s[0].as_u64().unwrap() as usize <= i
+                            && end <= s[1].as_u64().unwrap() as usize
+                    })
+                {
+                    continue;
+                }
+                list.push(json!([i, end, kind, score]));
+            }
+        }
+        spans.push(Value::Array(list));
+    }
+    jr(200, json!({"spans": spans}))
+}
+
+#[tokio::test]
+async fn pii_ner_imperative_verbs_are_not_masked() {
+    let ner = serve(axum::Router::new().fallback(ner_verbs_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echo/v1"]}, "pii": {"ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let text = "Find the most recent invoice from Kingfisher Bay Agro.\n\nFind the invoice from Acme\n\nCheck my calendar\n\nSend it to Priya\n\nShow GitHub notifications\n\n- Find My: tracks lost earbuds";
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", text, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=public; masked=3");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], text);
+    let up = received("echo/v1");
+    let b = &up[0];
+    for verb in [
+        "Find the most recent",
+        "Find the invoice",
+        "Check my calendar",
+        "Send it to",
+        "Show GitHub",
+        "- Find My:",
+    ] {
+        assert!(b.contains(verb), "verb masked, missing {verb:?}: {b}");
+    }
+    for raw in ["Kingfisher", "Bay Agro", "Priya", "Acme"] {
+        assert!(!b.contains(raw), "upstream saw {raw:?}: {b}");
+    }
+}
