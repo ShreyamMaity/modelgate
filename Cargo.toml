@@ -17,6 +17,8 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio-stream = "0.1"
 bytes = "1"
 fastrand = "2"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+aho-corasick = "1"
 
 [profile.release]
 opt-level = 3

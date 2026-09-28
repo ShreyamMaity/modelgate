@@ -1,5 +1,6 @@
 //! Forwarding a request through an ordered list of targets, failing over on trouble.
 
+use crate::pii::{self, Rehydrate, SseRehydrator, Tier};
 use crate::shim;
 use crate::state::{hms, log, AppState, Recent};
 use axum::body::Body;
@@ -67,11 +68,12 @@ fn apply_headers(
     h: &HeaderMap,
     t: &Target,
     translating: bool,
+    masked: bool,
 ) -> reqwest::RequestBuilder {
     let mut has_ct = false;
     for (k, v) in h {
         let n = k.as_str();
-        if HOP.contains(&n) {
+        if HOP.contains(&n) || (masked && pii::CONV_HEADERS.contains(&n)) {
             continue;
         }
         // Anthropic-style client credentials mean nothing to a chat-completions upstream.
@@ -118,25 +120,104 @@ where
     })
 }
 
-fn passthrough(
-    resp: reqwest::Response,
+pub struct Pii {
+    pub rh: Option<Arc<Rehydrate>>,
+    pub header: Option<String>,
+}
+
+fn pii_header(info: &Value) -> String {
+    format!(
+        "tier={}; masked={}",
+        info["tier"].as_str().unwrap_or("-"),
+        info["masked"].as_u64().unwrap_or(0)
+    )
+}
+
+fn head(
+    resp: &reqwest::Response,
     label: &str,
     attempts: usize,
-    idle: Duration,
-) -> Response<Body> {
+    p: &Pii,
+) -> axum::http::response::Builder {
     let mut b = Response::builder().status(resp.status());
     for (k, v) in resp.headers() {
         if !HOP.contains(&k.as_str()) {
             b = b.header(k, v);
         }
     }
+    if let Some(h) = &p.header {
+        b = b.header("x-gateway-pii", h);
+    }
     b.header("x-gateway-target", label)
         .header("x-gateway-attempts", attempts.to_string())
-        .body(Body::from_stream(idle_stream(
-            Box::pin(resp.bytes_stream()),
-            idle,
-        )))
-        .unwrap()
+}
+
+async fn passthrough(
+    resp: reqwest::Response,
+    label: &str,
+    attempts: usize,
+    idle: Duration,
+    wait: Duration,
+    p: Pii,
+) -> Response<Body> {
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let b = head(&resp, label, attempts, &p);
+    let Some(rh) = p.rh else {
+        return b
+            .body(Body::from_stream(idle_stream(
+                Box::pin(resp.bytes_stream()),
+                idle,
+            )))
+            .unwrap();
+    };
+    if ct.contains("event-stream") {
+        let s = Box::pin(idle_stream(Box::pin(resp.bytes_stream()), idle));
+        let out = futures_util::stream::unfold(
+            (s, Some(SseRehydrator::new(rh))),
+            |(mut s, rz)| async move {
+                let mut rz = rz?;
+                match s.next().await {
+                    Some(Ok(b)) => {
+                        let out = Bytes::from(rz.feed(&b));
+                        Some((Ok(out), (s, Some(rz))))
+                    }
+                    Some(Err(e)) => Some((Err(e), (s, None))),
+                    None => Some((Ok(Bytes::from(rz.finish())), (s, None))),
+                }
+            },
+        );
+        return b.body(Body::from_stream(out)).unwrap();
+    }
+    if ct.contains("json") || ct.is_empty() {
+        let data = match tokio::time::timeout(wait, resp.bytes()).await {
+            Ok(Ok(d)) => d,
+            _ => {
+                return json_response(
+                    504,
+                    &json!({"error": {"message": "upstream response timed out"}}),
+                    &[],
+                )
+            }
+        };
+        let body = match serde_json::from_slice::<Value>(&data) {
+            Ok(mut v) => {
+                rh.json(&mut v);
+                Bytes::from(v.to_string())
+            }
+            Err(_) => data,
+        };
+        return b.body(Body::from(body)).unwrap();
+    }
+    b.body(Body::from_stream(idle_stream(
+        Box::pin(resp.bytes_stream()),
+        idle,
+    )))
+    .unwrap()
 }
 
 fn translated_stream(
@@ -145,8 +226,11 @@ fn translated_stream(
     label: &str,
     attempts: usize,
     idle: Duration,
+    p: Pii,
 ) -> Response<Body> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    let pii_hdr = p.header.clone();
+    let mut rz = p.rh.map(SseRehydrator::new);
     tokio::spawn(async move {
         let mut conv = shim::StreamConv::new(&model);
         for e in conv.start() {
@@ -157,9 +241,17 @@ fn translated_stream(
         let mut s = Box::pin(resp.bytes_stream());
         loop {
             let events = match tokio::time::timeout(idle, s.next()).await {
-                Ok(Some(Ok(b))) => conv.feed(&b),
+                Ok(Some(Ok(b))) => match &mut rz {
+                    Some(r) => conv.feed(&r.feed(&b)),
+                    None => conv.feed(&b),
+                },
                 Ok(None) => {
-                    for e in conv.finish() {
+                    let mut tail = match &mut rz {
+                        Some(r) => conv.feed(&r.finish()),
+                        None => Vec::new(),
+                    };
+                    tail.extend(conv.finish());
+                    for e in tail {
                         let _ = tx.send(Ok(e)).await;
                     }
                     return;
@@ -184,11 +276,14 @@ fn translated_stream(
             }
         }
     });
-    Response::builder()
+    let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .header("x-gateway-target", label)
+        .header(header::CACHE_CONTROL, "no-cache");
+    if let Some(h) = pii_hdr {
+        b = b.header("x-gateway-pii", h);
+    }
+    b.header("x-gateway-target", label)
         .header("x-gateway-attempts", attempts.to_string())
         .body(Body::from_stream(
             tokio_stream::wrappers::ReceiverStream::new(rx),
@@ -202,14 +297,23 @@ async fn translated_buffered(
     label: &str,
     attempts: usize,
     wait: Duration,
+    p: Pii,
 ) -> Response<Body> {
-    let extra = [
+    let mut extra = vec![
         ("x-gateway-target", label.to_owned()),
         ("x-gateway-attempts", attempts.to_string()),
     ];
+    if let Some(h) = &p.header {
+        extra.push(("x-gateway-pii", h.clone()));
+    }
     match tokio::time::timeout(wait, resp.bytes()).await {
         Ok(Ok(b)) => match serde_json::from_slice::<Value>(&b) {
-            Ok(v) => json_response(200, &shim::from_openai(&v, model), &extra),
+            Ok(mut v) => {
+                if let Some(rh) = &p.rh {
+                    rh.json(&mut v);
+                }
+                json_response(200, &shim::from_openai(&v, model), &extra)
+            }
             Err(_) => json_response(
                 502,
                 &shim::error_body(502, "upstream returned invalid JSON"),
@@ -271,14 +375,59 @@ pub async fn relay(
 
     let mut attempts: Vec<Value> = Vec::new();
     let mut last: Option<(u16, Option<header::HeaderValue>, Bytes)> = None;
+    let ckey = pii::conv_key(o.headers, parsed.as_ref());
     for (key, t) in ordered {
-        let body = match (&t.model, &parsed) {
-            (Some(m), Some(v)) => {
-                let mut v = v.clone();
-                v["model"] = json!(m);
-                Bytes::from(v.to_string())
+        let tier = if st.pii.enabled {
+            let spec = if t.base == st.upstream {
+                t.model.clone().unwrap_or_else(|| req_model.clone())
+            } else {
+                t.label.clone()
+            };
+            Some(cfg.pii.tier(&st.target_spec(&spec)))
+        } else {
+            None
+        };
+        let masking = tier.is_some_and(Tier::masks);
+        let mut info: Option<Value> = tier.map(|t| json!({"tier": t.name(), "masked": 0}));
+        let mut rh: Option<Arc<Rehydrate>> = None;
+        let body = if masking {
+            let tier = tier.unwrap_or(Tier::Public);
+            let masked = parsed
+                .as_ref()
+                .ok_or_else(|| "body is not JSON".to_owned())
+                .and_then(|v| {
+                    let mut v = v.clone();
+                    if let Some(m) = &t.model {
+                        v["model"] = json!(m);
+                    }
+                    st.pii
+                        .mask(&ckey, &mut v, tier, &cfg.pii)
+                        .map(|(r, h)| (v, r, h))
+                });
+            match masked {
+                Ok((v, r, h)) => {
+                    info = Some(r.to_json(tier));
+                    if !h.is_empty() {
+                        rh = Some(h);
+                    }
+                    Bytes::from(v.to_string())
+                }
+                Err(e) => {
+                    st.pii.note_blocked();
+                    log("pii_blocked", json!({"target": t.label, "error": e}));
+                    attempts.push(json!({"target": t.label, "error": "pii-blocked"}));
+                    continue;
+                }
             }
-            _ => payload.clone(),
+        } else {
+            match (&t.model, &parsed) {
+                (Some(m), Some(v)) => {
+                    let mut v = v.clone();
+                    v["model"] = json!(m);
+                    Bytes::from(v.to_string())
+                }
+                _ => payload.clone(),
+            }
         };
         let url = format!(
             "{}{}",
@@ -290,6 +439,7 @@ pub async fn relay(
             o.headers,
             &t,
             o.translate.is_some(),
+            masking,
         );
         let t0 = Instant::now();
         let resp = match tokio::time::timeout(ttfb, rb.send()).await {
@@ -334,9 +484,13 @@ pub async fn relay(
         }
         log(
             "served",
-            json!({"kind": o.kind, "path": o.path, "target": t.label, "status": status, "ttfb_ms": ms, "skipped": attempts}),
+            json!({"kind": o.kind, "path": o.path, "target": t.label, "status": status, "ttfb_ms": ms, "skipped": attempts, "pii": info}),
         );
         let n = attempts.len() + 1;
+        let p = Pii {
+            rh,
+            header: info.as_ref().map(pii_header),
+        };
         st.note(Recent {
             time: hms(),
             requested: req_model,
@@ -345,11 +499,12 @@ pub async fn relay(
             ms,
             attempts: n,
             skipped: attempts,
+            pii: info,
         });
         return match o.translate {
-            None => passthrough(resp, &t.label, n, idle),
-            Some(model) if streaming => translated_stream(resp, model, &t.label, n, idle),
-            Some(model) => translated_buffered(resp, &model, &t.label, n, ttfb).await,
+            None => passthrough(resp, &t.label, n, idle, ttfb, p).await,
+            Some(model) if streaming => translated_stream(resp, model, &t.label, n, idle, p),
+            Some(model) => translated_buffered(resp, &model, &t.label, n, ttfb, p).await,
         };
     }
 
@@ -366,6 +521,7 @@ pub async fn relay(
         ms: 0,
         attempts: attempts.len(),
         skipped: attempts.clone(),
+        pii: None,
     });
     if o.translate.is_some() {
         let (code, msg) = match &last {
@@ -419,10 +575,46 @@ pub async fn forward_raw(
         .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(|| "-".into());
     st.stats.lock().unwrap().requests += 1;
+    let mut info: Option<Value> = None;
+    let mut rh: Option<Arc<Rehydrate>> = None;
+    let mut payload = payload;
+    let mut masking = false;
+    let parsed = serde_json::from_slice::<Value>(&payload)
+        .ok()
+        .filter(Value::is_object);
+    if let Some(mut v) = parsed.filter(|_| st.pii.enabled) {
+        let tier = cfg.pii.tier(&st.target_spec(&req_model));
+        info = Some(json!({"tier": tier.name(), "masked": 0}));
+        if tier.masks() {
+            masking = true;
+            let ckey = pii::conv_key(headers, Some(&v));
+            match st.pii.mask(&ckey, &mut v, tier, &cfg.pii) {
+                Ok((r, h)) => {
+                    info = Some(r.to_json(tier));
+                    if !h.is_empty() {
+                        rh = Some(h);
+                    }
+                    payload = Bytes::from(v.to_string());
+                }
+                Err(e) => {
+                    st.pii.note_blocked();
+                    log("pii_blocked", json!({"target": "upstream", "error": e}));
+                    return raw_failed(
+                        st,
+                        req_model,
+                        format!("passthrough:{path}"),
+                        path,
+                        "pii-blocked",
+                    );
+                }
+            }
+        }
+    }
 
     let mut rb = st.client.request(method.clone(), &url);
     for (k, v) in headers {
-        if !HOP.contains(&k.as_str()) {
+        let n = k.as_str();
+        if !HOP.contains(&n) && !(masking && pii::CONV_HEADERS.contains(&n)) {
             rb = rb.header(k, v);
         }
     }
@@ -445,8 +637,12 @@ pub async fn forward_raw(
     let ms = t0.elapsed().as_millis() as u64;
     log(
         "served",
-        json!({"kind": kind, "path": path, "target": label, "status": status, "ttfb_ms": ms}),
+        json!({"kind": kind, "path": path, "target": label, "status": status, "ttfb_ms": ms, "pii": info}),
     );
+    let p = Pii {
+        rh,
+        header: info.as_ref().map(pii_header),
+    };
     st.note(Recent {
         time: hms(),
         requested: req_model,
@@ -455,8 +651,9 @@ pub async fn forward_raw(
         ms,
         attempts: 1,
         skipped: vec![],
+        pii: info,
     });
-    passthrough(resp, label, 1, idle)
+    passthrough(resp, label, 1, idle, ttfb, p).await
 }
 
 fn raw_failed(
@@ -479,11 +676,13 @@ fn raw_failed(
         ms: 0,
         attempts: 1,
         skipped: vec![json!({"target": "upstream", "error": what})],
+        pii: None,
     });
     let code = if what == "timeout" { 504 } else { 502 };
-    json_response(
-        code,
-        &json!({"error": {"message": format!("upstream {what} error")}}),
-        &[],
-    )
+    let msg = if what == "pii-blocked" {
+        "pii masking failed, request not sent".to_owned()
+    } else {
+        format!("upstream {what} error")
+    };
+    json_response(code, &json!({"error": {"message": msg}}), &[])
 }

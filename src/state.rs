@@ -24,6 +24,7 @@ pub struct Recent {
     pub ms: u64,
     pub attempts: usize,
     pub skipped: Vec<Value>,
+    pub pii: Option<Value>,
 }
 
 #[derive(Default)]
@@ -40,6 +41,7 @@ pub struct AppState {
     pub admin_token: Option<String>,
     pub passthrough: bool,
     pub client: reqwest::Client,
+    pub pii: crate::pii::Pii,
     pub started: Instant,
     cfg: Mutex<CfgSlot>,
     health: Mutex<HashMap<String, Cool>>,
@@ -71,6 +73,15 @@ pub fn log(event: &str, fields: Value) {
 
 impl AppState {
     pub fn new(path: PathBuf, upstream: String, admin_token: Option<String>) -> Arc<Self> {
+        Self::with_pii(path, upstream, admin_token, crate::pii::Pii::from_env())
+    }
+
+    pub fn with_pii(
+        path: PathBuf,
+        upstream: String,
+        admin_token: Option<String>,
+        pii: crate::pii::Pii,
+    ) -> Arc<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(30))
@@ -95,6 +106,7 @@ impl AppState {
                 "0" | "false" | "off" | "no"
             ),
             client,
+            pii,
             started: Instant::now(),
             cfg: Mutex::new((Arc::new(cfg), mt)),
             health: Mutex::new(HashMap::new()),
@@ -198,7 +210,7 @@ impl AppState {
             .unwrap()
             .iter()
             .map(|r| json!({"time": r.time, "requested": r.requested, "kind": r.kind, "served_by": r.served_by,
-                            "ms": r.ms, "attempts": r.attempts, "skipped": r.skipped}))
+                            "ms": r.ms, "attempts": r.attempts, "skipped": r.skipped, "pii": r.pii}))
             .collect::<Vec<_>>())
     }
 
@@ -217,6 +229,24 @@ impl AppState {
                 }
             }
         }
+    }
+
+    pub fn target_spec(&self, spec: &str) -> String {
+        let models = self.models.lock().unwrap();
+        if let Some((p, _)) = spec.split_once('/') {
+            if models
+                .iter()
+                .any(|m| crate::chain::provider_of(m) == Some(p))
+            {
+                return spec.to_owned();
+            }
+        }
+        models
+            .iter()
+            .find(|m| m.get("id").and_then(Value::as_str) == Some(spec))
+            .and_then(crate::chain::provider_of)
+            .map(|p| format!("{p}/{spec}"))
+            .unwrap_or_else(|| spec.to_owned())
     }
 
     /// Ids the upstream itself serves over `/v1/messages` (no translation needed for these).

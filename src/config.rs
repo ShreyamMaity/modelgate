@@ -60,6 +60,7 @@ pub struct Config {
     /// Providers shown with a "paid" badge in the UI.
     pub paid_providers: Vec<String>,
     pub upstream: Option<String>,
+    pub pii: crate::pii::Policy,
 }
 
 impl Config {
@@ -129,6 +130,7 @@ impl Config {
             .get("upstream")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let pii = crate::pii::Policy::from_value(root.get("pii"));
         Config {
             root,
             chains,
@@ -136,6 +138,7 @@ impl Config {
             routes,
             paid_providers,
             upstream,
+            pii,
         }
     }
 

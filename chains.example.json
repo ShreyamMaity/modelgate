@@ -16,5 +16,12 @@
         }
       ]
     }
+  },
+  "pii": {
+    "default": "public",
+    "tiers": {
+      "local": ["my-box/*"],
+      "trusted_masked": ["provider-a/*"]
+    }
   }
 }
