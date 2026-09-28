@@ -112,7 +112,19 @@ fn last_user(v: &Value) -> String {
 }
 
 fn echo(model: &str, v: &Value) -> Response<Body> {
-    let text = last_user(v);
+    let mut text = last_user(v);
+    if model.starts_with("echoname") {
+        let w: Vec<String> = text.split_whitespace().map(str::to_owned).collect();
+        text = format!(
+            "{}'s note: {} {} met {} {}. Bye {}",
+            w[0],
+            w[0].to_lowercase(),
+            w[1].to_lowercase(),
+            w[0].to_uppercase(),
+            w[1].to_uppercase(),
+            w[0]
+        );
+    }
     let stream = v["stream"] == true;
     if model.starts_with("localfail") {
         return jr(503, json!({"error": "local box asleep"}));
@@ -1528,4 +1540,221 @@ async fn rejected_optional_field_is_dropped_and_the_same_target_retried() {
         "good/x",
         "unrelated 400s still fail over"
     );
+}
+
+static NER_SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+const NER_FAKE: &[(&str, &str)] = &[
+    ("Priya Venkataraman", "PERSON"),
+    ("Kaveri Agro Foods", "ORG"),
+    ("Koramangala", "LOCATION"),
+];
+
+async fn ner_mock(req: Request) -> Response<Body> {
+    let raw = to_bytes(req.into_body(), 1 << 22).await.unwrap();
+    let v: Value = serde_json::from_slice(&raw).unwrap_or(Value::Null);
+    let mut spans = Vec::new();
+    for t in v["texts"].as_array().cloned().unwrap_or_default() {
+        let t = t.as_str().unwrap_or("").to_owned();
+        NER_SEEN.lock().unwrap().push(t.clone());
+        let mut list = Vec::new();
+        for (name, kind) in NER_FAKE {
+            for (i, _) in t.match_indices(name) {
+                list.push(json!([i, i + name.len(), kind, 0.97]));
+            }
+        }
+        spans.push(Value::Array(list));
+    }
+    jr(200, json!({"spans": spans}))
+}
+
+const NER_TEXT: &str = "Priya Venkataraman from Kaveri Agro Foods lives in Koramangala";
+
+fn assert_no_names(bodies: &[String]) {
+    assert!(!bodies.is_empty(), "upstream got nothing");
+    for b in bodies {
+        for raw in [
+            "Priya",
+            "Venkataraman",
+            "Kaveri",
+            "Koramangala",
+            "PRIYA",
+            "priya",
+        ] {
+            assert!(!b.contains(raw), "upstream saw {raw:?}: {b}");
+        }
+        assert!(!b.contains("<PERSON_"), "surrogates, not tags: {b}");
+    }
+}
+
+#[tokio::test]
+async fn pii_ner_names_become_surrogates_and_come_back() {
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echoname/n1"]}, "pii": {"ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let want = "Priya's note: priya venkataraman met PRIYA VENKATARAMAN. Bye Priya";
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", NER_TEXT, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-pii"), "tier=public; masked=3");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], want);
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", NER_TEXT, true))
+        .await;
+    let (t, _) = sse_text(r).await;
+    assert_eq!(t, want, "streamed surrogates split across 3-char chunks");
+    let up = received("echoname/n1");
+    assert_eq!(up.len(), 2);
+    assert_no_names(&up);
+    assert_eq!(up[0], up[1].replace("\"stream\":true", "\"stream\":false"));
+    let status: Value = h
+        .http
+        .get(format!("{}/_gateway/pii", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(status["status"]["ner"]["calls"].as_u64().unwrap() >= 1);
+    assert!(status["status"]["ner"]["cache_hits"].as_u64().unwrap() >= 1);
+    assert!(!status.to_string().contains("Priya"));
+}
+
+#[tokio::test]
+async fn pii_ner_surrogates_in_tool_arguments_are_rehydrated() {
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echotool/n4"]}, "pii": {"ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", NER_TEXT, false))
+        .await;
+    let v: Value = r.json().await.unwrap();
+    let args: Value = serde_json::from_str(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(args["text"], NER_TEXT);
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", NER_TEXT, true))
+        .await;
+    let (_, a) = sse_text(r).await;
+    let args: Value = serde_json::from_str(&a).unwrap();
+    assert_eq!(args["text"], NER_TEXT);
+    assert_no_names(&received("echotool/n4"));
+}
+
+#[tokio::test]
+async fn pii_ner_tag_style_is_configurable() {
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echo/n5"]}, "pii": {"ner": {"url": ner}, "placeholder_style": {"PERSON": "tag"}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("c", NER_TEXT, false))
+        .await;
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], NER_TEXT);
+    let up = received("echo/n5");
+    assert!(up[0].contains("<PERSON_A> from "), "{}", up[0]);
+    assert!(!up[0].contains("Kaveri") && !up[0].contains("Koramangala"));
+}
+
+#[tokio::test]
+async fn pii_ner_down_blocks_public_but_local_still_serves_without_ner() {
+    let h = start(
+        json!({"chains": {"d": ["echo/n6", "echo/n6local"]},
+               "pii": {"tiers": {"local": ["echo/n6local"]}, "ner": {"url": "http://127.0.0.1:1", "timeout_ms": 500}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("d", NER_TEXT, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-target"), "echo/n6local");
+    assert!(
+        received("echo/n6").is_empty(),
+        "public target never contacted"
+    );
+    assert!(received("echo/n6local")[0].contains("Priya Venkataraman"));
+    let recent: Value = h
+        .http
+        .get(format!("{}/_gateway/recent", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(recent[0]["skipped"][0]["error"], "pii-blocked");
+    assert!(recent[0]["skipped"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .starts_with("ner unavailable"));
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let marker = "LocalOnlyMarker Priya Venkataraman";
+    let h = start(
+        json!({"chains": {"l": ["echo/n7local"]},
+               "pii": {"tiers": {"local": ["echo/n7local"]}, "ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let r = h
+        .post("/v1/chat/completions", user_chat("l", marker, false))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert!(
+        NER_SEEN
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|t| !t.contains("LocalOnlyMarker")),
+        "local tier never runs NER"
+    );
+}
+
+#[tokio::test]
+async fn pii_address_surrogate_streams_back_intact() {
+    let ner = serve(axum::Router::new().fallback(ner_mock)).await;
+    let h = start(
+        json!({"chains": {"c": ["echo/n8"]}, "pii": {"ner": {"url": ner}}}),
+        None,
+    )
+    .await;
+    let text =
+        "Priya Venkataraman's parcel goes to Flat 12, Lake View Road, Kochi 682020. Thanks Priya.";
+    for stream in [false, true] {
+        let r = h
+            .post("/v1/chat/completions", user_chat("c", text, stream))
+            .await;
+        let got = if stream {
+            sse_text(r).await.0
+        } else {
+            let v: Value = r.json().await.unwrap();
+            v["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(got, text);
+    }
+    for b in received("echo/n8") {
+        assert!(
+            !b.contains("682020") && !b.contains("Lake View") && !b.contains("Priya"),
+            "{b}"
+        );
+    }
 }

@@ -1,13 +1,73 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Default)]
 pub struct Rehydrate {
     pub text: HashMap<String, String>,
     pub tool_extra: HashMap<String, String>,
     pub tools: bool,
+    pub names: Vec<(String, String)>,
+    ac: OnceLock<Option<(AhoCorasick, usize)>>,
+    fz: OnceLock<Fuzzy>,
 }
+
+type Fuzzy = (Vec<(String, usize)>, HashSet<String>);
+
+pub fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for i in 1..=a.len() {
+        let mut cur = vec![i; b.len() + 1];
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+fn alpha_words(s: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut st: Option<usize> = None;
+    let mut prev: Option<char> = None;
+    for (i, c) in s.char_indices() {
+        if c.is_alphabetic() {
+            if st.is_none() && !prev.is_some_and(|p| p.is_alphanumeric() || p == '_') {
+                st = Some(i);
+            }
+        } else if let Some(a) = st.take() {
+            if !(c.is_ascii_digit() || c == '_') {
+                out.push((a, i));
+            }
+        }
+        prev = Some(c);
+    }
+    if let Some(a) = st {
+        out.push((a, s.len()));
+    }
+    out
+}
+
+const NAME_SKIP: &[&str] = &[
+    "id",
+    "model",
+    "role",
+    "type",
+    "object",
+    "finish_reason",
+    "stop_reason",
+    "name",
+    "call_id",
+    "tool_call_id",
+    "item_id",
+    "status",
+    "signature",
+    "system_fingerprint",
+];
 
 const MAX_PH: usize = 100;
 
@@ -94,8 +154,178 @@ pub fn unescape_angles(s: &str) -> Option<String> {
 }
 
 impl Rehydrate {
+    pub fn new(
+        text: HashMap<String, String>,
+        tool_extra: HashMap<String, String>,
+        tools: bool,
+        names: Vec<(String, String)>,
+    ) -> Rehydrate {
+        Rehydrate {
+            text,
+            tool_extra,
+            tools,
+            names,
+            ac: OnceLock::new(),
+            fz: OnceLock::new(),
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty() && (self.tool_extra.is_empty() || !self.tools)
+        self.text.is_empty() && self.names.is_empty() && (self.tool_extra.is_empty() || !self.tools)
+    }
+
+    fn names_ac(&self) -> Option<&(AhoCorasick, usize)> {
+        self.ac
+            .get_or_init(|| {
+                if self.names.is_empty() {
+                    return None;
+                }
+                let max = self.names.iter().map(|n| n.0.len()).max().unwrap_or(0);
+                AhoCorasickBuilder::new()
+                    .match_kind(MatchKind::LeftmostLongest)
+                    .ascii_case_insensitive(true)
+                    .build(self.names.iter().map(|n| n.0.as_str()))
+                    .ok()
+                    .map(|a| (a, max))
+            })
+            .as_ref()
+    }
+
+    fn fuzzy(&self) -> &Fuzzy {
+        self.fz.get_or_init(|| {
+            let mut parts = Vec::new();
+            let mut known = HashSet::new();
+            for (i, (sur, raw)) in self.names.iter().enumerate() {
+                for w in sur.split_whitespace().chain(raw.split_whitespace()) {
+                    known.insert(w.to_lowercase());
+                }
+                if sur.len() >= 5 && sur.chars().all(char::is_alphabetic) {
+                    parts.push((sur.to_lowercase(), i));
+                }
+            }
+            (parts, known)
+        })
+    }
+
+    fn fuzzy_hit(&self, w: &str) -> Option<usize> {
+        let (parts, known) = self.fuzzy();
+        let lw = w.to_lowercase();
+        if lw.chars().count() < 5 || known.contains(&lw) {
+            return None;
+        }
+        let first = lw.chars().next();
+        let mut best: Option<(usize, usize)> = None;
+        let mut tie = false;
+        for (p, idx) in parts {
+            if p.chars().next() != first {
+                continue;
+            }
+            let lim = if p.chars().count() >= 8 { 2 } else { 1 };
+            let d = edit_distance(&lw, p);
+            if d == 0 || d > lim {
+                continue;
+            }
+            match best {
+                None => best = Some((d, *idx)),
+                Some((bd, _)) if d < bd => {
+                    best = Some((d, *idx));
+                    tie = false;
+                }
+                Some((bd, bi)) if d == bd && self.names[bi].1 != self.names[*idx].1 => tie = true,
+                _ => {}
+            }
+        }
+        best.filter(|_| !tie).map(|b| b.1)
+    }
+
+    fn names_scan(&self, s: &str, escape: bool) -> Option<String> {
+        let (ac, _) = self.names_ac()?;
+        let mut hits: Vec<(usize, usize, String)> = Vec::new();
+        for m in ac.find_iter(s) {
+            let (st, en) = (m.start(), m.end());
+            if super::bounded(s, st, en) {
+                let raw = &self.names[m.pattern().as_usize()].1;
+                hits.push((st, en, super::surrogate::apply_case(raw, &s[st..en])));
+            }
+        }
+        if !self.fuzzy().0.is_empty() {
+            let mut fz = Vec::new();
+            for (st, en) in alpha_words(s) {
+                if hits.iter().any(|h| st < h.1 && h.0 < en) {
+                    continue;
+                }
+                if let Some(i) = self.fuzzy_hit(&s[st..en]) {
+                    fz.push((
+                        st,
+                        en,
+                        super::surrogate::apply_case(&self.names[i].1, &s[st..en]),
+                    ));
+                }
+            }
+            if !fz.is_empty() {
+                hits.extend(fz);
+                hits.sort_by_key(|h| h.0);
+            }
+        }
+        if hits.is_empty() {
+            return None;
+        }
+        let mut out = String::with_capacity(s.len());
+        let mut at = 0;
+        for (st, en, v) in hits {
+            out.push_str(&s[at..st]);
+            if escape {
+                let q = serde_json::to_string(&v).unwrap_or_default();
+                out.push_str(&q[1..q.len() - 1]);
+            } else {
+                out.push_str(&v);
+            }
+            at = en;
+        }
+        out.push_str(&s[at..]);
+        Some(out)
+    }
+
+    pub fn names_cut(&self, text: &str, tool: bool) -> usize {
+        if tool && !self.tools {
+            return text.len();
+        }
+        let Some((_, max)) = self.names_ac() else {
+            return text.len();
+        };
+        let mut lo = text.len().saturating_sub(max + 1);
+        while !text.is_char_boundary(lo) {
+            lo += 1;
+        }
+        let mut prev = text[..lo].chars().next_back();
+        for (off, c) in text[lo..].char_indices() {
+            let i = lo + off;
+            let start =
+                c.is_alphanumeric() && !prev.is_some_and(|p| p.is_alphanumeric() || p == '_');
+            prev = Some(c);
+            if !start {
+                continue;
+            }
+            let tail = &text[i..];
+            if self.names.iter().any(|(sur, _)| {
+                tail.len() <= sur.len()
+                    && sur.is_char_boundary(tail.len())
+                    && sur[..tail.len()].eq_ignore_ascii_case(tail)
+            }) {
+                return i;
+            }
+        }
+        if let Some(&(st, en)) = alpha_words(text).last() {
+            let firsts: HashSet<Option<char>> =
+                self.fuzzy().0.iter().map(|p| p.0.chars().next()).collect();
+            if en == text.len()
+                && en - st <= 32
+                && firsts.contains(&text[st..].chars().next().map(|c| c.to_ascii_lowercase()))
+            {
+                return st;
+            }
+        }
+        text.len()
     }
 
     fn get(&self, ph: &str, tool: bool) -> Option<&str> {
@@ -113,6 +343,20 @@ impl Rehydrate {
     }
 
     pub fn text(&self, s: &str, tool: bool, escape: bool) -> Option<String> {
+        self.text_opt(s, tool, escape, true)
+    }
+
+    fn text_opt(&self, s: &str, tool: bool, escape: bool, names: bool) -> Option<String> {
+        let named = if names && !self.names.is_empty() && (!tool || self.tools) {
+            self.names_scan(s, escape)
+        } else {
+            None
+        };
+        let cur = named.as_deref().unwrap_or(s);
+        self.tags(cur, tool, escape).or(named)
+    }
+
+    fn tags(&self, s: &str, tool: bool, escape: bool) -> Option<String> {
         if escape {
             if let Some(u) = unescape_angles(s) {
                 return self.scan(&u, tool, escape);
@@ -174,7 +418,8 @@ impl Rehydrate {
                     Some("arguments" | "partial_json") => (true, true),
                     _ => (tool, false),
                 };
-                if let Some(n) = self.text(s, t, esc) {
+                let names = !key.is_some_and(|k| NAME_SKIP.contains(&k));
+                if let Some(n) = self.text_opt(s, t, esc, names) {
                     *s = n;
                 }
             }
@@ -293,10 +538,13 @@ impl SseRehydrator {
         }
         let (emit, hold) = if fin {
             (text.as_str(), "")
-        } else if tool {
-            split_hold_escaped(&text)
         } else {
-            split_hold(&text)
+            let (e, _) = if tool {
+                split_hold_escaped(&text)
+            } else {
+                split_hold(&text)
+            };
+            text.split_at(e.len().min(self.rh.names_cut(&text, tool)))
         };
         let out = self
             .rh
@@ -599,11 +847,7 @@ mod tests {
         text.insert("<PASSWORD_A>".to_owned(), "p\"w\\1".to_owned());
         let mut tool_extra = HashMap::new();
         tool_extra.insert("<SECRET:maps>".to_owned(), "FAKEKEY".to_owned());
-        Arc::new(Rehydrate {
-            text,
-            tool_extra,
-            tools: true,
-        })
+        Arc::new(Rehydrate::new(text, tool_extra, true, Vec::new()))
     }
 
     fn run(r: &mut SseRehydrator, chunks: &[&str]) -> String {
@@ -632,6 +876,66 @@ mod tests {
             }
         }
         (text, args)
+    }
+
+    fn names() -> Arc<Rehydrate> {
+        Arc::new(Rehydrate::new(
+            HashMap::new(),
+            HashMap::new(),
+            true,
+            vec![
+                ("Chaitanya Bhandari".into(), "Priya Venkataraman".into()),
+                ("Chaitanya".into(), "Priya".into()),
+                ("Bhandari".into(), "Venkataraman".into()),
+                (
+                    "12, Palm Grove Apartments, Surat 514522".into(),
+                    "Flat 12, Lake View Road, Kochi 682020".into(),
+                ),
+            ],
+        ))
+    }
+
+    #[test]
+    fn surrogates_exact_partial_case_fuzzy() {
+        let r = names();
+        assert_eq!(
+            r.text(
+                "CHAITANYA BHANDARI and chaitanya's dog; Chaituya called Bhandri",
+                false,
+                false
+            )
+            .unwrap(),
+            "PRIYA VENKATARAMAN and priya's dog; Priya called Venkataraman"
+        );
+        assert!(r
+            .text("Chapter one, Chaitra and Bhanu at the cafe", false, false)
+            .is_none());
+        assert_eq!(edit_distance("chaituya", "chaitanya"), 2);
+    }
+
+    #[test]
+    fn surrogates_stream_split_everywhere() {
+        let src =
+            "Chaitanya Bhandari's parcel: 12, Palm Grove Apartments, Surat 514522. Bye Chaituya!";
+        let want = "Priya Venkataraman's parcel: Flat 12, Lake View Road, Kochi 682020. Bye Priya!";
+        for size in 1..12 {
+            let cs: Vec<char> = src.chars().collect();
+            let mut sse = String::new();
+            for c in cs.chunks(size) {
+                let piece: String = c.iter().collect();
+                sse.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"choices": [{"index": 0, "delta": {"content": piece}}]})
+                ));
+            }
+            sse.push_str(&format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                json!({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+            ));
+            let mut z = SseRehydrator::new(names());
+            let out = run(&mut z, &[&sse]);
+            assert_eq!(chat_text(&out).0, want, "chunk size {size}");
+        }
     }
 
     #[test]
@@ -671,11 +975,12 @@ mod tests {
         let mut m = json!({"content": [{"type": "text", "text": "<CARD_A>"}, {"type": "tool_use", "input": {"key": "<SECRET:maps>"}}]});
         r.json(&mut m);
         assert_eq!(m["content"][1]["input"]["key"], "FAKEKEY");
-        let no = Arc::new(Rehydrate {
-            text: HashMap::new(),
-            tool_extra: r.tool_extra.clone(),
-            tools: false,
-        });
+        let no = Arc::new(Rehydrate::new(
+            HashMap::new(),
+            r.tool_extra.clone(),
+            false,
+            Vec::new(),
+        ));
         let mut m2 = json!({"input": {"key": "<SECRET:maps>"}});
         no.json(&mut m2);
         assert_eq!(m2["input"]["key"], "<SECRET:maps>");

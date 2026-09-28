@@ -8,6 +8,7 @@ use axum::http::{header, HeaderMap, Response, StatusCode};
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -445,6 +446,7 @@ pub async fn relay(
     let mut attempts: Vec<Value> = Vec::new();
     let mut last: Option<(u16, Option<header::HeaderValue>, Bytes)> = None;
     let ckey = pii::conv_key(o.headers, parsed.as_ref());
+    let mut ner_by_tier: HashMap<Tier, Result<Vec<pii::ner::Found>, String>> = HashMap::new();
     'targets: for (key, mut t) in ordered {
         if t.max_input.is_some_and(|n| payload.len() > n) {
             attempts.push(json!({"target": t.label, "error": "input too large"}));
@@ -486,18 +488,25 @@ pub async fn relay(
         let mut rh: Option<Arc<Rehydrate>> = None;
         let body = if masking {
             let tier = tier.unwrap_or(Tier::Public);
-            let masked = parsed
-                .as_ref()
-                .ok_or_else(|| "body is not JSON".to_owned())
-                .and_then(|v| {
-                    let mut v = v.clone();
-                    if let Some(m) = &t.model {
-                        v["model"] = json!(m);
-                    }
-                    st.pii
-                        .mask(&ckey, &mut v, tier, &cfg.pii)
-                        .map(|(r, h)| (v, r, h))
-                });
+            if let (Some(v), false) = (&parsed, ner_by_tier.contains_key(&tier)) {
+                let r = st.pii.ner_find(&st.client, tier, &cfg.pii, v).await;
+                ner_by_tier.insert(tier, r);
+            }
+            let found = ner_by_tier.get(&tier).cloned().unwrap_or(Ok(Vec::new()));
+            let masked = found.and_then(|found| {
+                parsed
+                    .as_ref()
+                    .ok_or_else(|| "body is not JSON".to_owned())
+                    .and_then(|v| {
+                        let mut v = v.clone();
+                        if let Some(m) = &t.model {
+                            v["model"] = json!(m);
+                        }
+                        st.pii
+                            .mask_with(&ckey, &mut v, tier, &cfg.pii, &found)
+                            .map(|(r, h)| (v, r, h))
+                    })
+            });
             match masked {
                 Ok((v, r, h)) => {
                     info = Some(r.to_json(tier));
@@ -509,7 +518,7 @@ pub async fn relay(
                 Err(e) => {
                     st.pii.note_blocked();
                     log("pii_blocked", json!({"target": t.label, "error": e}));
-                    attempts.push(json!({"target": t.label, "error": "pii-blocked"}));
+                    attempts.push(json!({"target": t.label, "error": "pii-blocked", "detail": e}));
                     continue;
                 }
             }
@@ -694,7 +703,11 @@ pub async fn forward_raw(
         if tier.masks() {
             masking = true;
             let ckey = pii::conv_key(headers, Some(&v));
-            match st.pii.mask(&ckey, &mut v, tier, &cfg.pii) {
+            let masked = match st.pii.ner_find(&st.client, tier, &cfg.pii, &v).await {
+                Ok(found) => st.pii.mask_with(&ckey, &mut v, tier, &cfg.pii, &found),
+                Err(e) => Err(e),
+            };
+            match masked {
                 Ok((r, h)) => {
                     info = Some(r.to_json(tier));
                     if !h.is_empty() {
