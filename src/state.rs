@@ -44,6 +44,8 @@ pub struct AppState {
     pub pii: crate::pii::Pii,
     pub presence: crate::presence::Presence,
     pub started: Instant,
+    pub pins: crate::pins::Pins,
+    pub write_lock: Mutex<()>,
     cfg: Mutex<CfgSlot>,
     health: Mutex<HashMap<String, Cool>>,
     pub stats: Mutex<Stats>,
@@ -88,6 +90,16 @@ impl AppState {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("http client");
+        let pins_path = std::env::var("PINS_FILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                path.parent()
+                    .map(|d| d.to_path_buf())
+                    .unwrap_or_default()
+                    .join("pins.json")
+            });
         let (cfg, mt) = match config::load(&path) {
             Ok(c) => (c, config::stamp_of(&path)),
             Err(e) => {
@@ -110,6 +122,8 @@ impl AppState {
             pii,
             presence: crate::presence::Presence::from_env(),
             started: Instant::now(),
+            pins: crate::pins::Pins::load(Some(pins_path)),
+            write_lock: Mutex::new(()),
             cfg: Mutex::new((Arc::new(cfg), mt)),
             health: Mutex::new(HashMap::new()),
             stats: Mutex::new(Stats::default()),
@@ -163,8 +177,9 @@ impl AppState {
             .is_some_and(|c| c.until > Instant::now())
     }
 
-    /// Cool a target down: 30s, doubling per consecutive failure up to 10 minutes (or `retry_after`).
-    pub fn mark_bad(&self, key: &str, reason: &str, retry_after: Option<u64>) {
+    /// Cool a target down: `base` seconds (30 by default), doubling per consecutive failure up to
+    /// 10 minutes or `base` if larger (or `retry_after`).
+    pub fn mark_bad(&self, key: &str, reason: &str, retry_after: Option<u64>, base: u64) {
         let mut h = self.health.lock().unwrap();
         let c = h.entry(key.to_owned()).or_insert(Cool {
             until: Instant::now(),
@@ -172,7 +187,7 @@ impl AppState {
             last: String::new(),
         });
         c.fails += 1;
-        let secs = retry_after.unwrap_or_else(|| (30u64 << (c.fails - 1).min(5)).min(600));
+        let secs = retry_after.unwrap_or_else(|| (base << (c.fails - 1).min(5)).min(600.max(base)));
         c.until = Instant::now() + Duration::from_secs(secs);
         c.last = reason.to_owned();
     }
@@ -271,6 +286,15 @@ impl AppState {
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_owned))
             .collect()
     }
+}
+
+pub fn spawn_pin_flush(st: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            st.pins.flush();
+        }
+    });
 }
 
 pub fn spawn_presence(st: Arc<AppState>) {

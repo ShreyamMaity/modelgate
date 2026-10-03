@@ -1,4 +1,4 @@
-use modelgate::state::{log, spawn_presence, AppState};
+use modelgate::state::{log, spawn_pin_flush, spawn_presence, AppState};
 use modelgate::{config, server};
 use serde_json::json;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ Every option can also be set with an environment variable:
     PII_REHYDRATE_TOOLS  0 to leave placeholders in tool-call arguments instead of real values
     PRESENCE_URL tailmesh-style hub; targets with \"presence\": \"<node>\" are used only while
                  GET <url>/presence says use_bonsai for that node (else skipped, no cooldown)
+    PINS_FILE    where sticky-group pins and failover events are kept (default pins.json next to CONFIG)
     PRESENCE_POLL_MS / PRESENCE_MAX_AGE_MS / PRESENCE_TIMEOUT_MS   (defaults 1500 / 5000 / 800)
 
 Docs: README.md    Config UI: http://<listen>/config    Activity: http://<listen>/_gateway/
@@ -78,6 +79,7 @@ async fn main() {
     });
 
     spawn_presence(st.clone());
+    spawn_pin_flush(st.clone());
 
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,
@@ -94,8 +96,20 @@ async fn main() {
         eprintln!("note: listening on {listen} without ADMIN_TOKEN - anyone who can reach this port can change your config");
     }
     let shutdown = async {
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("signal handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
         let _ = tokio::signal::ctrl_c().await;
     };
+    let flush = st.clone();
     if let Err(e) = axum::serve(listener, server::router(st))
         .with_graceful_shutdown(shutdown)
         .await
@@ -103,4 +117,5 @@ async fn main() {
         eprintln!("server error: {e}");
         std::process::exit(1);
     }
+    flush.pins.flush();
 }

@@ -12,6 +12,7 @@ pub const SETTING_BOUNDS: &[(&str, f64, f64)] = &[
     ("ttfb_stream", 3.0, 120.0),
     ("stream_idle", 10.0, 600.0),
     ("max_tokens_cap", 256.0, 200_000.0),
+    ("keepalive", 1.0, 60.0),
 ];
 pub const HISTORY_KEEP: usize = 40;
 
@@ -25,6 +26,7 @@ pub struct Settings {
     pub stream_idle: f64,
     /// Upper bound applied to `max_tokens` on translated requests.
     pub max_tokens_cap: u64,
+    pub keepalive: f64,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             ttfb_stream: 20.0,
             stream_idle: 120.0,
             max_tokens_cap: 32768,
+            keepalive: 10.0,
         }
     }
 }
@@ -123,6 +126,7 @@ impl Config {
             ttfb_stream: num("ttfb_stream", d.ttfb_stream),
             stream_idle: num("stream_idle", d.stream_idle),
             max_tokens_cap: num("max_tokens_cap", d.max_tokens_cap as f64) as u64,
+            keepalive: num("keepalive", d.keepalive),
         };
         let mut routes = Vec::new();
         if let Some(obj) = root.get("routes").and_then(Value::as_object) {
@@ -182,6 +186,33 @@ impl Config {
     pub fn chain(&self, name: &str) -> Option<&Vec<String>> {
         self.chains.iter().find(|(n, _)| n == name).map(|(_, v)| v)
     }
+
+    pub fn policies(&self) -> Map<String, Value> {
+        self.root
+            .get("policies")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn policy(&self, group: &str) -> crate::policy::Policy {
+        crate::policy::Policy::from_value(self.root.get("policies").and_then(|p| p.get(group)))
+    }
+}
+
+/// Validates a `policies` object against the groups being saved; policies of unknown groups are dropped.
+pub fn validate_policies(v: &Value, groups: &Groups) -> Result<Map<String, Value>, String> {
+    let o = v.as_object().ok_or("policies must be an object")?;
+    let mut out = Map::new();
+    for (name, p) in o {
+        if !groups.iter().any(|(n, _)| n == name) {
+            continue;
+        }
+        let clean =
+            crate::policy::validate(p).map_err(|(f, m)| format!("group {name:?}: {m} ({f})"))?;
+        out.insert(name.clone(), Value::Object(clean));
+    }
+    Ok(out)
 }
 
 pub fn valid_group_name(name: &str) -> bool {
@@ -306,6 +337,16 @@ pub fn save(
     settings: &Map<String, Value>,
     note: &str,
 ) -> Result<(), String> {
+    save_with(path, chains, settings, None, note)
+}
+
+pub fn save_with(
+    path: &Path,
+    chains: &[(String, Vec<String>)],
+    settings: &Map<String, Value>,
+    policies: Option<&Map<String, Value>>,
+    note: &str,
+) -> Result<(), String> {
     let mut root = std::fs::read_to_string(path)
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(t.trim_start_matches('\u{feff}')).ok())
@@ -334,6 +375,23 @@ pub fn save(
     obj.insert("chains".into(), Value::Object(groups));
     for (k, v) in settings {
         obj.insert(k.clone(), v.clone());
+    }
+    let keep: Map<String, Value> = match policies {
+        Some(p) => p.clone(),
+        None => obj
+            .get("policies")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    let keep: Map<String, Value> = keep
+        .into_iter()
+        .filter(|(k, _)| chains.iter().any(|(n, _)| n == k))
+        .collect();
+    if keep.is_empty() {
+        obj.remove("policies");
+    } else {
+        obj.insert("policies".into(), Value::Object(keep));
     }
     let tmp = path.with_extension("json.tmp");
     std::fs::write(

@@ -185,7 +185,15 @@ details.set summary::-webkit-details-marker{display:none}
 details.set[open] summary::after{content:" ‑";color:var(--accent-2)}
 .sgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;padding:6px 16px 16px}
 .sgrid label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--mut)}
-.sgrid input{color:var(--fg)}
+.sgrid input,.sgrid select{color:var(--fg)}
+.sgrid label.bad input{border-color:var(--bad)}
+.perr{color:var(--bad);font-size:12px}
+.psec{border-top:1px solid var(--line)}
+.psec h3{font-size:11px;margin:0;padding:13px 16px 4px;color:var(--mut);text-transform:uppercase;letter-spacing:.08em;font-weight:600}
+.psec .ptop{display:flex;gap:10px;align-items:center;padding:4px 16px 0;flex-wrap:wrap}
+.pins{padding:0 16px 14px;font-size:12.5px;color:var(--mut)}
+.pins .spec{font-size:12px}
+.pins div{padding:2px 0}
 .savebar{
   position:fixed;left:0;right:0;bottom:0;
   background:color-mix(in srgb,var(--panel) 85%,transparent);
@@ -313,10 +321,10 @@ const el = (tag, props = {}, ...kids) => {     // tiny DOM builder; text is alwa
   for (const k of kids.flat()) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
   return n;
 };
-const S = { chains: {}, saved: "", settings: {}, defaults: {}, version: "", sel: null };
+const S = { chains: {}, saved: "", settings: {}, defaults: {}, version: "", sel: null, policies: {}, pdefaults: {}, pfields: {} };
 let MODELS = [], STATUS = { cooling_down: {}, served: {} }, RESULTS = {}, pickSel = new Set(), tab = "models";
 
-const snapshot = () => JSON.stringify({ c: S.chains, s: S.settings });
+const snapshot = () => JSON.stringify({ c: S.chains, s: S.settings, p: S.policies });
 const dirty = () => snapshot() !== S.saved;
 const fmtCtx = n => n ? (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : Math.round(n / 1000) + "k") + " ctx" : "";
 const fmtPrice = p => { const v = parseFloat(p); return isNaN(v) ? "" : v === 0 ? "free" : "$" + (v * 1e6).toFixed(2) + "/M in"; };
@@ -344,6 +352,7 @@ async function api(path, opt, retried) {
 async function load() {
   const [cfg, models, st] = await Promise.all([api("/_gateway/config"), api("/v1/models"), api("/_gateway/status")]);
   S.chains = cfg.chains; S.settings = cfg.settings; S.defaults = cfg.defaults; S.version = cfg.version;
+  S.policies = cfg.policies || {}; S.pdefaults = cfg.policy_defaults || {}; S.pfields = cfg.policy_fields || {};
   PAID = new Set(cfg.paid_providers || []);
   S.saved = snapshot();
   const seen = new Set();
@@ -386,7 +395,7 @@ function renderEditor() {
   const copy = el("button", { type: "button" }, "Copy name");
   copy.onclick = () => navigator.clipboard?.writeText(name).then(() => toast("Copied “" + name + "”"), () => toast(name));
   const del = el("button", { type: "button", className: "danger" }, "Delete group");
-  del.onclick = () => { if (confirm("Delete group “" + name + "”?")) { delete S.chains[name]; S.sel = Object.keys(S.chains)[0] || null; render(); } };
+  del.onclick = () => { if (confirm("Delete group “" + name + "”?")) { delete S.chains[name]; delete S.policies[name]; S.sel = Object.keys(S.chains)[0] || null; render(); } };
   ed.append(el("div", { className: "ehead" }, nameIn, copy, del,
     el("span", { className: "hint" }, "Use it as the model name, e.g. ", el("code", {}, "--model " + name))));
 
@@ -401,6 +410,74 @@ function renderEditor() {
   test.onclick = () => testGroup(test);
   ed.append(el("div", { className: "bar" }, add, test,
     el("span", { className: "hint", style: "align-self:center" }, "Order matters: the first healthy entry answers.")));
+  ed.append(renderPolicy(name));
+}
+
+/* ---------- routing policy ---------- */
+const PLABELS = {
+  mode: ["Mode", { sticky: "Sticky: keep the model that answered", strict: "Strict: one model, never switch", failover: "Failover: start from the top every time" }],
+  sticky_scope: ["Pin lasts for", { conversation: "One conversation", day: "The whole day (IST), all chats", until_changed: "Until it fails or the list changes" }],
+  sticky_ttl_minutes: ["Conversation pin idle expiry (min)"],
+  failover_on: ["Switch models on", { errors: "Errors only (wait out slow models)", errors_and_timeouts: "Errors and timeouts" }],
+  retry_same_model: ["Retries on the same model first"],
+  ttfb_seconds: ["Streaming: wait for first token (s)"],
+  total_timeout_seconds: ["Total time limit (s)"],
+  cooldown_seconds: ["Cooldown after a failure (s)"],
+};
+function policyErrors(p) {
+  const errs = {};
+  for (const [k, v] of Object.entries(p || {})) {
+    const f = S.pfields[k]; if (!f || v === null || v === undefined) continue;
+    if (f.type === "enum" && !f.values.includes(v)) errs[k] = "pick one of the options";
+    if ((f.type === "integer" || f.type === "number") && (typeof v !== "number" || isNaN(v) || v < f.min || v > f.max || (f.type === "integer" && !Number.isInteger(v))))
+      errs[k] = (f.type === "integer" ? "whole number " : "") + f.min + " to " + f.max + (f.nullable ? ", or blank" : "");
+  }
+  return errs;
+}
+function renderPolicy(name) {
+  const own = S.policies[name];
+  const sec = el("section", { className: "psec", "aria-label": "Routing policy" }, el("h3", {}, "Routing policy"));
+  const custom = el("input", { type: "checkbox", checked: !!own });
+  custom.onchange = () => { if (custom.checked) S.policies[name] = Object.assign({}, S.pdefaults); else delete S.policies[name]; render(); };
+  sec.append(el("div", { className: "ptop" }, el("label", { className: "hint" }, custom, " Custom policy for this group"),
+    el("span", { className: "hint" }, own ? "" : "Using defaults: sticky per conversation, global timeouts.")));
+  const grid = el("div", { className: "sgrid" }); const errs = policyErrors(own);
+  for (const [k, f] of Object.entries(S.pfields)) {
+    const [label, opts] = PLABELS[k] || [k];
+    const val = own ? own[k] : S.pdefaults[k];
+    let input;
+    if (f.type === "enum") {
+      input = el("select", { disabled: !own });
+      for (const v of f.values) input.append(el("option", { value: v, selected: v === val }, opts?.[v] || v));
+      input.onchange = () => { own[k] = input.value; render(); };
+    } else {
+      input = el("input", { type: "number", min: f.min, max: f.max, step: f.type === "integer" ? 1 : "any", disabled: !own,
+        value: val ?? "", placeholder: f.nullable ? "global default" : "" });
+      input.onchange = () => { if (input.value === "" && f.nullable) own[k] = null; else own[k] = Number(input.value); render(); };
+    }
+    const lab = el("label", { className: errs[k] ? "bad" : "" }, label, input);
+    if (errs[k]) lab.append(el("span", { className: "perr" }, errs[k]));
+    grid.append(lab);
+  }
+  sec.append(grid);
+  const pins = el("div", { className: "pins" }, "Loading pins…");
+  sec.append(pins);
+  loadPins(name, pins);
+  return sec;
+}
+async function loadPins(name, box) {
+  try {
+    const j = await api("/_gateway/pins?group=" + encodeURIComponent(name));
+    box.replaceChildren();
+    const clear = el("button", { type: "button", className: "ghost" }, "Clear pins");
+    clear.onclick = async () => { try { await api("/_gateway/pins?group=" + encodeURIComponent(name), { method: "DELETE" }); toast("Pins cleared"); loadPins(name, box); } catch (e) { toast("Not cleared: " + e.message, true); } };
+    box.append(el("div", {}, j.pins.length + " active pin" + (j.pins.length === 1 ? "" : "s") + " ", j.pins.length ? clear : ""));
+    for (const p of j.pins.slice(0, 8)) box.append(el("div", {}, (p.session === "*" ? "all chats" : p.session) + " → ", el("span", { className: "spec" }, p.model), " (" + p.source + ")"));
+    const ev = j.events.slice(0, 5);
+    if (ev.length) box.append(el("div", { style: "margin-top:6px" }, "Recent switches:"));
+    for (const e of ev) box.append(el("div", {}, new Date(e.time * 1000).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour: "numeric", minute: "2-digit", hour12: true, day: "numeric", month: "short" }) + ": ",
+      el("span", { className: "spec" }, e.from), " → ", el("span", { className: "spec" }, e.to || "failed"), " (" + e.reason + ")"));
+  } catch (e) { box.textContent = "Pins unavailable: " + e.message; }
 }
 
 function rowFor(list, spec, i) {
@@ -450,6 +527,7 @@ function renameGroup(old, neu, input) {
   if (neu in S.chains) { toast("A group called “" + neu + "” already exists", true); input.value = old; return; }
   const next = {};
   for (const [k, v] of Object.entries(S.chains)) next[k === old ? neu : k] = v.map(e => e === old ? neu : e);
+  if (S.policies[old]) { S.policies[neu] = S.policies[old]; delete S.policies[old]; }
   S.chains = next; S.sel = neu; render();
 }
 
@@ -493,14 +571,18 @@ function renderBar() {
 window.onbeforeunload = e => { if (dirty()) { e.preventDefault(); e.returnValue = ""; } };
 
 $("#btnSave").onclick = async () => {
+  const bad = Object.keys(S.policies).find(g => Object.keys(policyErrors(S.policies[g])).length);
+  if (bad) { S.sel = bad; render(); return toast("Fix the routing policy of “" + bad + "” first", true); }
+  const empty = Object.keys(S.chains).find(g => !S.chains[g].length);
+  if (empty) { S.sel = empty; render(); return toast("“" + empty + "” has no models yet", true); }
   try {
-    const r = await api("/_gateway/config", { method: "PUT", body: JSON.stringify({ chains: S.chains, settings: S.settings, version: S.version }) });
+    const r = await api("/_gateway/config", { method: "PUT", body: JSON.stringify({ chains: S.chains, settings: S.settings, policies: S.policies, version: S.version }) });
     S.version = r.version; S.saved = snapshot(); renderBar(); toast("Saved. Live now.");
   } catch (e) {
     toast(e.status === 409 ? e.message : "Not saved: " + e.message, true);
   }
 };
-$("#btnDiscard").onclick = () => { const o = JSON.parse(S.saved); S.chains = o.c; S.settings = o.s; if (!(S.sel in S.chains)) S.sel = Object.keys(S.chains)[0] || null; render(); };
+$("#btnDiscard").onclick = () => { const o = JSON.parse(S.saved); S.chains = o.c; S.settings = o.s; S.policies = o.p || {}; if (!(S.sel in S.chains)) S.sel = Object.keys(S.chains)[0] || null; render(); };
 
 /* ---------- picker ---------- */
 function openPicker() {

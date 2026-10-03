@@ -27,7 +27,28 @@ fn sse(chunks: Vec<Value>) -> Response<Body> {
         .unwrap()
 }
 
+static FAILING: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn set_failing(model: &str, on: bool) {
+    let mut f = FAILING.lock().unwrap();
+    f.retain(|m| m != model);
+    if on {
+        f.push(model.to_owned());
+    }
+}
+
 async fn chat_body(model: &str, stream: bool, v: &Value) -> Response<Body> {
+    if FAILING.lock().unwrap().iter().any(|m| m == model) {
+        return jr(503, json!({"error": "toggled off"}));
+    }
+    if model.starts_with("once") {
+        let mut seen = SEEN.lock().unwrap();
+        if !seen.iter().any(|m| m == model) {
+            seen.push(model.to_owned());
+            return jr(503, json!({"error": "first call fails"}));
+        }
+    }
     if model == "strict/x" && v.get("reasoning_effort").is_some() {
         return jr(
             400,
@@ -1933,4 +1954,544 @@ async fn pii_ner_imperative_verbs_are_not_masked() {
     for raw in ["Kingfisher", "Bay Agro", "Priya", "Acme"] {
         assert!(!b.contains(raw), "upstream saw {raw:?}: {b}");
     }
+}
+
+// ---------------------------------------------------------------- sticky policy
+impl H {
+    async fn chat_s(
+        &self,
+        model: &str,
+        session: Option<&str>,
+        stream: bool,
+        pin: Option<&str>,
+    ) -> reqwest::Response {
+        let mut rb = self.http.post(format!("{}/v1/chat/completions", self.base)).json(
+            &json!({"model": model, "stream": stream, "messages": [{"role": "user", "content": "hi"}]}),
+        );
+        if let Some(s) = session {
+            rb = rb.header("x-luna-session", s);
+        }
+        if let Some(p) = pin {
+            rb = rb.header("x-luna-pin", p);
+        }
+        rb.send().await.unwrap()
+    }
+    async fn get_json(&self, path: &str) -> Value {
+        self.http
+            .get(format!("{}{path}", self.base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn sticky_pins_the_first_answer_and_moves_only_on_failure() {
+    let h = start(
+        json!({"chains": {"g": ["toggle1/x", "good/x"]}, "policies": {"g": {"mode": "sticky"}}}),
+        None,
+    )
+    .await;
+    let r = h.chat_s("g", Some("s1"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "toggle1/x");
+    assert_eq!(hdr(&r, "x-served-group"), "g");
+    assert_eq!(hdr(&r, "x-pin"), "new");
+    assert_eq!(hdr(&r, "x-luna-session"), "s1");
+    assert_eq!(hdr(&r, "x-failover"), "");
+    assert!(hdr(&r, "x-gateway-policy").starts_with("mode=sticky"));
+    set_failing("toggle1/x", true);
+    let r = h.chat_s("g", Some("s1"), false, None).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    assert_eq!(hdr(&r, "x-pin"), "moved");
+    assert_eq!(
+        hdr(&r, "x-failover"),
+        "toggle1/x -> good/x; reason=status 503"
+    );
+    set_failing("toggle1/x", false);
+    h.st.mark_good("openai:toggle1/x", "toggle1/x");
+    let r = h.chat_s("g", Some("s1"), false, None).await;
+    assert_eq!(
+        hdr(&r, "x-served-model"),
+        "good/x",
+        "the pin does not drift back when the old model recovers"
+    );
+    assert_eq!(hdr(&r, "x-pin"), "kept");
+    assert_eq!(hdr(&r, "x-failover"), "");
+    let r = h.chat_s("g", Some("s2"), false, None).await;
+    assert_eq!(
+        hdr(&r, "x-served-model"),
+        "toggle1/x",
+        "a new conversation starts from the top"
+    );
+    let r = h.chat_s("g", None, false, None).await;
+    assert_eq!(hdr(&r, "x-pin"), "none");
+    let pins = h.get_json("/_gateway/pins?session=s1").await;
+    assert_eq!(pins["pins"][0]["model"], "good/x");
+    assert_eq!(pins["pins"][0]["source"], "failover");
+    assert_eq!(pins["events"][0]["from"], "toggle1/x");
+    assert_eq!(pins["events"][0]["to"], "good/x");
+    assert_eq!(pins["events"][0]["reason"], "status 503");
+    let file = std::fs::read_to_string(h.dir.join("pins.json")).unwrap();
+    assert!(
+        file.contains("good/x") && file.contains("s1"),
+        "pins persist: {file}"
+    );
+}
+
+#[tokio::test]
+async fn hermes_conversation_header_is_a_session_and_luna_headers_stay_local() {
+    let h = start(json!({"chains": {"g": ["good/x", "good2/x"]}}), None).await;
+    let r = h
+        .http
+        .post(format!("{}/v1/chat/completions", h.base))
+        .header("x-conversation-id", "conv-9")
+        .header("x-luna-pin", "good2/x")
+        .json(&json!({"model": "g", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hdr(&r, "x-luna-session"), "conv-9");
+    assert_eq!(hdr(&r, "x-served-model"), "good2/x");
+    assert_eq!(hdr(&r, "x-pin"), "explicit");
+    let r = h
+        .http
+        .post(format!("{}/v1/chat/completions", h.base))
+        .header("x-conversation-id", "conv-9")
+        .json(&json!({"model": "g", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        hdr(&r, "x-served-model"),
+        "good2/x",
+        "an explicit pin sticks for the session"
+    );
+    let bad = h.chat_s("g", Some("a"), false, Some("nope/zzz")).await;
+    assert_eq!(bad.status(), 400);
+    assert_eq!(
+        bad.json::<Value>().await.unwrap()["error"]["type"],
+        "gateway_bad_pin"
+    );
+    let ok = h.chat_s("g", Some("a"), false, Some("p1/m1")).await;
+    assert_eq!(
+        hdr(&ok, "x-served-model"),
+        "p1/m1",
+        "any model the upstream lists can be pinned"
+    );
+}
+
+#[tokio::test]
+async fn strict_never_fails_over() {
+    let h = start(
+        json!({"chains": {"s": ["dead/x", "good/x"]}, "policies": {"s": {"mode": "strict", "retry_same_model": 2}}}),
+        None,
+    )
+    .await;
+    let before = received("dead/x").len();
+    let r = h.chat_s("s", Some("x"), false, None).await;
+    assert_eq!(r.status(), 503);
+    assert_eq!(hdr(&r, "x-served-model"), "none");
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "gateway_strict");
+    assert_eq!(v["error"]["reason"], "status 402");
+    assert_eq!(v["error"]["model"], "dead/x");
+    assert_eq!(
+        received("dead/x").len() - before,
+        1,
+        "402 is not retried, and nothing else is tried"
+    );
+    let r = h.chat_s("s", Some("x"), false, Some("good/x")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    let pins = h.get_json("/_gateway/pins?group=s").await;
+    assert_eq!(pins["events"][0]["to"], Value::Null);
+}
+
+#[tokio::test]
+async fn failover_mode_restarts_from_the_top_each_time() {
+    let h = start(
+        json!({"chains": {"f": ["toggle2/x", "good/x"]}, "policies": {"f": {"mode": "failover", "cooldown_seconds": 0}}}),
+        None,
+    )
+    .await;
+    set_failing("toggle2/x", true);
+    let r = h.chat_s("f", Some("s"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    assert_eq!(hdr(&r, "x-pin"), "none");
+    set_failing("toggle2/x", false);
+    let r = h.chat_s("f", Some("s"), false, None).await;
+    assert_eq!(
+        hdr(&r, "x-served-model"),
+        "toggle2/x",
+        "cooldown 0 and no pin: back to the top"
+    );
+}
+
+#[tokio::test]
+async fn retry_same_model_before_failing_over() {
+    let h = start(
+        json!({"chains": {"r": ["once1/x", "good/x"], "n": ["once2/x", "good/x"]},
+               "policies": {"r": {"retry_same_model": 1}, "n": {"retry_same_model": 0}}}),
+        None,
+    )
+    .await;
+    let r = h.chat_s("r", Some("s"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "once1/x");
+    assert_eq!(hdr(&r, "x-failover"), "");
+    assert_eq!(received("once1/x").len(), 2);
+    let r = h.chat_s("n", Some("s"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+}
+
+#[tokio::test]
+async fn errors_only_policy_does_not_fail_over_on_timeout() {
+    let h = start(
+        json!({"chains": {"e": ["slow/x", "unused9/x"]}, "policies": {"e": {"failover_on": "errors", "ttfb_seconds": 3}}}),
+        None,
+    )
+    .await;
+    let t = Instant::now();
+    let r = h.chat_s("e", Some("s"), true, None).await;
+    assert_eq!(r.status(), 504);
+    assert!(t.elapsed() < Duration::from_secs(5));
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "gateway_timeout");
+    assert!(received("unused9/x").is_empty());
+}
+
+#[tokio::test]
+async fn slow_stream_commits_early_keeps_alive_and_reports_the_failover() {
+    let h = start(
+        json!({"keepalive": 1, "chains": {"k": ["slow/x", "good/x"]}, "policies": {"k": {"ttfb_seconds": 3}}}),
+        None,
+    )
+    .await;
+    let t = Instant::now();
+    let r = h.chat_s("k", Some("s"), true, None).await;
+    assert!(
+        t.elapsed() < Duration::from_millis(2500),
+        "headers arrive before any model answered"
+    );
+    assert_eq!(r.status(), 200);
+    assert_eq!(hdr(&r, "x-gateway-early"), "1");
+    assert_eq!(hdr(&r, "x-served-model"), "slow/x");
+    let body = r.text().await.unwrap();
+    assert!(body.starts_with(": keepalive\n\n"), "{body}");
+    let served = body
+        .lines()
+        .find(|l| l.starts_with(": gateway-served "))
+        .unwrap();
+    let v: Value = serde_json::from_str(&served[": gateway-served ".len()..]).unwrap();
+    assert_eq!(v["model"], "good/x");
+    assert_eq!(v["failover"]["from"], "slow/x");
+    assert_eq!(v["failover"]["reason"], "timeout");
+    assert!(body.contains("pong "));
+    let usage = body
+        .lines()
+        .find(|l| l.starts_with(": gateway-usage "))
+        .unwrap();
+    let u: Value = serde_json::from_str(&usage[": gateway-usage ".len()..]).unwrap();
+    assert_eq!(u["prompt_tokens"], 7);
+    assert_eq!(u["completion_tokens"], 3);
+    assert_eq!(u["model"], "good/x");
+}
+
+#[tokio::test]
+async fn early_committed_strict_failure_arrives_as_an_error_event() {
+    let h = start(
+        json!({"keepalive": 1, "chains": {"k": ["slow/x"]}, "policies": {"k": {"mode": "strict", "ttfb_seconds": 3}}}),
+        None,
+    )
+    .await;
+    let r = h.chat_s("k", Some("s"), true, None).await;
+    assert_eq!(r.status(), 200);
+    let body = r.text().await.unwrap();
+    let line = body.lines().find(|l| l.starts_with("data: {")).unwrap();
+    let v: Value = serde_json::from_str(&line[6..]).unwrap();
+    assert_eq!(v["error"]["type"], "gateway_strict");
+    assert_eq!(v["error"]["model"], "slow/x");
+    assert!(body.ends_with("data: [DONE]\n\n"));
+}
+
+#[tokio::test]
+async fn streams_lead_with_the_served_model_and_anthropic_gets_headers() {
+    let h = start(json!({"chains": {"g": ["dead/x", "good/x"]}}), None).await;
+    let r = h.chat_s("g", Some("s"), true, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    let body = r.text().await.unwrap();
+    assert!(body.starts_with(": gateway-served {"), "{body}");
+    let a = h
+        .http
+        .post(format!("{}/v1/messages", h.base))
+        .header("x-luna-session", "an")
+        .json(&json!({"model": "g", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(a.status(), 200);
+    assert_eq!(hdr(&a, "x-served-model"), "good/x");
+    assert_eq!(hdr(&a, "x-served-group"), "g");
+    let plain = h.chat("anything/goes").await;
+    assert_eq!(hdr(&plain, "x-served-group"), "-");
+    assert_eq!(hdr(&plain, "x-served-model"), "anything/goes");
+    assert_eq!(hdr(&plain, "x-gateway-target"), "upstream");
+    let s = h
+        .post(
+            "/v1/chat/completions",
+            json!({"model": "anything/goes", "stream": true, "messages": []}),
+        )
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        s.starts_with(": gateway-served {\"model\":\"anything/goes\""),
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn test_traffic_has_its_own_cooldowns() {
+    let h = start(json!({"chains": {"g": ["toggle4/x", "good/x"]}}), None).await;
+    set_failing("toggle4/x", true);
+    let r = h.chat_s("g", Some("test:e2e-1"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    set_failing("toggle4/x", false);
+    let real = h.chat_s("g", Some("user:main"), false, None).await;
+    assert_eq!(
+        hdr(&real, "x-served-model"),
+        "toggle4/x",
+        "a failure provoked by test traffic does not cool the model for real chats"
+    );
+    assert_eq!(hdr(&real, "x-failover"), "");
+    set_failing("toggle4/x", true);
+    let r = h
+        .http
+        .post(format!("{}/v1/chat/completions", h.base))
+        .header("x-luna-test", "1")
+        .json(&json!({"model": "g", "messages": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    set_failing("toggle4/x", false);
+    let status = h.get_json("/_gateway/status").await;
+    let keys: Vec<String> = status["cooling_down"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        keys.iter()
+            .filter(|k| k.contains("toggle4"))
+            .all(|k| k.starts_with("test:")),
+        "{keys:?}"
+    );
+}
+
+#[tokio::test]
+async fn day_scope_shares_one_pin_across_sessions() {
+    let h = start(
+        json!({"chains": {"d": ["toggle3/x", "good/x"]}, "policies": {"d": {"sticky_scope": "day"}}}),
+        None,
+    )
+    .await;
+    set_failing("toggle3/x", true);
+    assert_eq!(
+        hdr(
+            &h.chat_s("d", Some("a"), false, None).await,
+            "x-served-model"
+        ),
+        "good/x"
+    );
+    set_failing("toggle3/x", false);
+    h.st.mark_good("openai:toggle3/x", "toggle3/x");
+    let r = h.chat_s("d", Some("b"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good/x");
+    assert_eq!(hdr(&r, "x-pin"), "kept");
+    let pins = h.get_json("/_gateway/pins?group=d").await;
+    assert_eq!(pins["pins"][0]["session"], "*");
+    assert!(pins["pins"][0]["expires_at"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn groups_api_and_policies_in_config() {
+    let h = start(
+        json!({"chains": {"a": ["good/x"]}, "policies": {"a": {"mode": "strict"}}}),
+        None,
+    )
+    .await;
+    let g = h.get_json("/_gateway/groups").await;
+    assert_eq!(g["groups"][0]["name"], "a");
+    assert_eq!(g["groups"][0]["policy"]["mode"], "strict");
+    assert_eq!(g["groups"][0]["policy_set"], true);
+    assert_eq!(g["defaults"]["mode"], "sticky");
+    assert!(g["fields"]["sticky_scope"]["values"].is_array());
+
+    let url = format!("{}/_gateway/groups", h.base);
+    let post = |b: Value| h.http.post(&url).json(&b).send();
+    let r = post(json!({"name": "b", "models": ["good/x", "dead/x"], "policy": {"mode": "sticky", "ttfb_seconds": 45}}))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["group"]["policy"]["ttfb_seconds"], 45.0);
+    let dup = post(json!({"name": "b", "models": ["good/x"]}))
+        .await
+        .unwrap();
+    assert_eq!(dup.status(), 409);
+    let bad = post(json!({"name": "c", "models": ["good/x"], "policy": {"mode": "x"}}))
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    assert_eq!(bad.json::<Value>().await.unwrap()["field"], "policy.mode");
+    let empty = post(json!({"name": "c", "models": []})).await.unwrap();
+    assert_eq!(empty.status(), 400);
+    let foreign = h
+        .http
+        .post(&url)
+        .header("origin", "https://evil.example")
+        .json(&json!({"name": "c", "models": ["good/x"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), 403);
+    let stale = post(json!({"name": "c", "models": ["good/x"], "version": "nope"}))
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 409);
+
+    let r = h
+        .http
+        .put(format!("{url}/b"))
+        .json(&json!({"name": "b2", "policy": {"mode": "failover"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg = h.get_json("/_gateway/config").await;
+    assert_eq!(cfg["chains"]["b2"], json!(["good/x", "dead/x"]));
+    assert_eq!(cfg["policies"]["b2"]["mode"], "failover");
+    assert!(cfg["policies"].get("b").is_none());
+    assert_eq!(cfg["policy_defaults"]["mode"], "sticky");
+
+    let mut chains = cfg["chains"].clone();
+    chains["z"] = json!(["good/x"]);
+    let r = h
+        .http
+        .put(format!("{}/_gateway/config", h.base))
+        .json(&json!({"chains": chains, "version": cfg["version"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg = h.get_json("/_gateway/config").await;
+    assert_eq!(
+        cfg["policies"]["a"]["mode"], "strict",
+        "a save without policies keeps them"
+    );
+    let r = h
+        .http
+        .put(format!("{}/_gateway/config", h.base))
+        .json(&json!({"chains": cfg["chains"], "policies": {"a": {"mode": "nope"}}, "version": cfg["version"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let r = h
+        .http
+        .put(format!("{}/_gateway/config", h.base))
+        .json(&json!({"chains": cfg["chains"], "policies": {"z": {"mode": "strict"}}, "version": cfg["version"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let cfg = h.get_json("/_gateway/config").await;
+    assert!(cfg["policies"].get("a").is_none());
+    assert_eq!(cfg["policies"]["z"]["mode"], "strict");
+
+    let r = h.http.delete(format!("{url}/b2")).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(h.get_json("/_gateway/config").await["chains"]
+        .get("b2")
+        .is_none());
+    assert_eq!(
+        h.http
+            .delete(format!("{url}/b2"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn pins_api_sets_reads_and_clears() {
+    let h = start(json!({"chains": {"g": ["good/x", "good2/x"]}}), None).await;
+    let url = format!("{}/_gateway/pins", h.base);
+    let r = h
+        .http
+        .put(&url)
+        .json(&json!({"group": "g", "session": "s9", "model": "good2/x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let r = h.chat_s("g", Some("s9"), false, None).await;
+    assert_eq!(hdr(&r, "x-served-model"), "good2/x");
+    assert_eq!(hdr(&r, "x-pin"), "kept");
+    let bad = h
+        .http
+        .put(&url)
+        .json(&json!({"group": "g", "session": "s9", "model": "other/x"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let r = h
+        .http
+        .delete(format!("{url}?group=g&session=s9"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.json::<Value>().await.unwrap()["cleared"], 1);
+    assert_eq!(
+        hdr(
+            &h.chat_s("g", Some("s9"), false, None).await,
+            "x-served-model"
+        ),
+        "good/x"
+    );
+}
+
+#[tokio::test]
+async fn pins_read_needs_the_token_when_one_is_set() {
+    let h = start(json!({"chains": {"g": ["good/x"]}}), Some("tok")).await;
+    let url = format!("{}/_gateway/pins", h.base);
+    assert_eq!(h.http.get(&url).send().await.unwrap().status(), 401);
+    assert_eq!(
+        h.http
+            .get(&url)
+            .bearer_auth("tok")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        h.http
+            .get(format!("{}/_gateway/groups", h.base))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 }

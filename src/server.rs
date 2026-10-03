@@ -2,7 +2,9 @@
 
 use crate::chain;
 use crate::config::{self, Config};
-use crate::relay::{forward_raw, json_response, relay, Opts, Target};
+use crate::pins::Pins;
+use crate::policy::{self, Mode, Policy};
+use crate::relay::{forward_raw, json_response, relay, Opts, Plan, Target};
 use crate::shim;
 use crate::state::{log, AppState};
 use axum::body::{to_bytes, Body};
@@ -52,6 +54,10 @@ fn admin_guard(st: &AppState, h: &HeaderMap) -> Option<Response<Body>> {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if origin.split_once("://").map(|x| x.1) != Some(host) {
+            log(
+                "admin_refused",
+                json!({"reason": "cross-origin", "origin": origin, "host": host}),
+            );
             return Some(err(403, "cross-origin request refused"));
         }
     }
@@ -62,6 +68,7 @@ fn admin_guard(st: &AppState, h: &HeaderMap) -> Option<Response<Body>> {
             .and_then(|v| v.strip_prefix("Bearer "))
             .unwrap_or("");
         if !ct_eq(given, tok) {
+            log("admin_refused", json!({"reason": "token"}));
             return Some(err(401, "admin token required"));
         }
     }
@@ -102,6 +109,415 @@ fn target_models(cfg: &Config) -> Vec<Value> {
         .collect()
 }
 
+const SESSION_HEADERS: &[&str] = &[
+    "x-luna-session",
+    "x-conversation-id",
+    "x-hermes-session-id",
+    "x-session-id",
+    "x-claude-code-session-id",
+];
+
+pub fn session_of(h: &HeaderMap) -> Option<String> {
+    SESSION_HEADERS.iter().find_map(|n| {
+        let v = h.get(*n)?.to_str().ok()?.trim();
+        if v.is_empty() {
+            return None;
+        }
+        Some(
+            v.chars()
+                .take(200)
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '@' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect(),
+        )
+    })
+}
+
+fn known_model(st: &AppState, cfg: &Config, spec: &str) -> bool {
+    cfg.target(spec).is_some()
+        || st.models().iter().any(|m| {
+            let id = m.get("id").and_then(Value::as_str).unwrap_or("");
+            id == spec
+                || chain::provider_of(m).is_some_and(|p| {
+                    spec.strip_prefix(p)
+                        .and_then(|r| r.strip_prefix('/'))
+                        .is_some_and(|r| r == id)
+                })
+        })
+}
+
+/// Orders a group's targets for this request (explicit pin, then session pin, then the list)
+/// and builds the policy plan. Models that are not groups get no plan.
+#[allow(clippy::result_large_err)]
+fn plan_for(
+    st: &AppState,
+    cfg: &Config,
+    model: &str,
+    h: &HeaderMap,
+    list: Vec<String>,
+) -> Result<(Vec<String>, Option<Plan>), Response<Body>> {
+    let name = chain::bare(model);
+    if cfg.chain(name).is_none() {
+        return Ok((list, None));
+    }
+    let policy = cfg.policy(name);
+    let session = session_of(h);
+    let explicit = h
+        .get("x-luna-pin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    if let Some(e) = &explicit {
+        if !list.contains(e) && !known_model(st, cfg, e) {
+            return Err(json_response(
+                400,
+                &json!({"error": {"type": "gateway_bad_pin", "message": format!("X-Luna-Pin {e:?} is not a model of group {name} or a known model")}}),
+                &[],
+            ));
+        }
+    }
+    let key = if policy.mode == Mode::Failover {
+        None
+    } else {
+        Pins::key(policy.scope, session.as_deref())
+    };
+    let pin = key
+        .as_deref()
+        .and_then(|k| st.pins.get(name, k, &list, policy.scope))
+        .map(|p| p.model);
+    let mut ordered = list.clone();
+    if let Some(first) = explicit.clone().or_else(|| pin.clone()) {
+        ordered.retain(|x| *x != first);
+        ordered.insert(0, first);
+    }
+    Ok((
+        ordered,
+        Some(Plan {
+            group: name.to_owned(),
+            policy,
+            session,
+            key,
+            pin,
+            explicit,
+            list,
+        }),
+    ))
+}
+
+fn query(uri: &axum::http::Uri, key: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        (pct(k) == key).then(|| pct(v)).filter(|v| !v.is_empty())
+    })
+}
+
+fn pct(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16)
+                {
+                    Ok(n) => {
+                        out.push(n);
+                        i += 3;
+                        continue;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b'+' => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn read_guard(st: &AppState, h: &HeaderMap) -> Option<Response<Body>> {
+    let tok = st.admin_token.as_ref()?;
+    let given = h
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    (!ct_eq(given, tok)).then(|| err(401, "admin token required"))
+}
+
+fn group_json(st: &AppState, cfg: &Config, name: &str, list: &[String]) -> Value {
+    let expanded = resolve(st, cfg, name).unwrap_or_else(|| list.to_vec());
+    json!({"name": name, "models": list, "expanded": expanded, "policy": cfg.policy(name).to_json(),
+           "policy_set": cfg.root.get("policies").and_then(|p| p.get(name)).is_some()})
+}
+
+fn groups_list(st: &AppState, cfg: &Config) -> Response<Body> {
+    let groups: Vec<Value> = cfg
+        .chains
+        .iter()
+        .map(|(n, l)| group_json(st, cfg, n, l))
+        .collect();
+    json_response(
+        200,
+        &json!({"version": st.version(), "groups": groups, "defaults": Policy::default().to_json(), "fields": policy::fields()}),
+        &[],
+    )
+}
+
+fn pins_get(st: &AppState, uri: &axum::http::Uri, h: &HeaderMap) -> Response<Body> {
+    if let Some(r) = read_guard(st, h) {
+        return r;
+    }
+    let group = query(uri, "group");
+    let session = query(uri, "session");
+    json_response(
+        200,
+        &st.pins.json(group.as_deref(), session.as_deref()),
+        &[],
+    )
+}
+
+fn pins_put(st: &AppState, h: &HeaderMap, raw: &Bytes) -> Response<Body> {
+    if let Some(r) = admin_guard(st, h) {
+        return r;
+    }
+    let v: Value = serde_json::from_slice(raw).unwrap_or(Value::Null);
+    let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    let cfg = st.config();
+    let Some(group) = s("group").filter(|g| cfg.chain(g).is_some()) else {
+        return field_err("group", "group must name an existing group");
+    };
+    let policy = cfg.policy(&group);
+    let Some(model) = s("model").filter(|m| !m.is_empty()) else {
+        return field_err("model", "model is required");
+    };
+    let list = resolve(st, &cfg, &group).unwrap_or_default();
+    if !list.contains(&model) {
+        return field_err("model", "model must be one of the group's models");
+    }
+    let session = s("session");
+    let Some(key) = Pins::key(policy.scope, session.as_deref()) else {
+        return field_err(
+            "session",
+            "session is required for conversation-scoped groups",
+        );
+    };
+    st.pins.set(
+        &group,
+        &key,
+        &model,
+        policy.scope,
+        policy.ttl_minutes,
+        "api",
+        &list,
+    );
+    log(
+        "pin_set",
+        json!({"group": group, "session": key, "model": model}),
+    );
+    json_response(
+        200,
+        &json!({"ok": true, "pins": st.pins.json(Some(&group), None)["pins"]}),
+        &[],
+    )
+}
+
+fn pins_delete(st: &AppState, uri: &axum::http::Uri, h: &HeaderMap) -> Response<Body> {
+    if let Some(r) = admin_guard(st, h) {
+        return r;
+    }
+    let Some(group) = query(uri, "group") else {
+        return field_err("group", "group is required");
+    };
+    let n = st.pins.clear(&group, query(uri, "session").as_deref());
+    json_response(200, &json!({"ok": true, "cleared": n}), &[])
+}
+
+fn field_err(field: &str, msg: &str) -> Response<Body> {
+    json_response(400, &json!({"error": msg, "field": field}), &[])
+}
+
+/// Single-group create/update/delete, applied atomically against the file on disk.
+fn group_write(
+    st: &AppState,
+    h: &HeaderMap,
+    method: &Method,
+    target: Option<String>,
+    raw: &Bytes,
+) -> Response<Body> {
+    if let Some(r) = admin_guard(st, h) {
+        return r;
+    }
+    let body: Value = if raw.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(raw) {
+            Ok(v) => v,
+            Err(_) => return field_err("body", "invalid json"),
+        }
+    };
+    let _lock = st.write_lock.lock().unwrap();
+    let cfg = st.reload();
+    if let Some(v) = body.get("version").filter(|v| !v.is_null()) {
+        let v = v
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| v.to_string());
+        if v != st.version() {
+            return json_response(
+                409,
+                &json!({"error": "The config was changed somewhere else. Reload to see it.", "version": st.version()}),
+                &[],
+            );
+        }
+    }
+    let mut groups = cfg.chains.clone();
+    let mut pols = cfg.policies();
+    let models = match body.get("models") {
+        None | Some(Value::Null) => None,
+        Some(m) => match m.as_array() {
+            Some(a) if !a.is_empty() => Some(a.clone()),
+            _ => return field_err("models", "models must be a non-empty list"),
+        },
+    };
+    let policy = match body.get("policy") {
+        None => None,
+        Some(Value::Null) => Some(None),
+        Some(p) => match policy::validate(p) {
+            Ok(m) => Some(Some(m)),
+            Err((f, m)) => return field_err(&format!("policy.{f}"), &m),
+        },
+    };
+    let (status, name, note) = match (method, target) {
+        (&Method::POST, None) => {
+            let Some(name) = body.get("name").and_then(Value::as_str).map(str::trim) else {
+                return field_err("name", "name is required");
+            };
+            if !config::valid_group_name(name) {
+                return field_err("name", "use letters, digits . _ - (max 40)");
+            }
+            if groups.iter().any(|(n, _)| n == name) {
+                return json_response(
+                    409,
+                    &json!({"error": format!("group {name} already exists"), "field": "name"}),
+                    &[],
+                );
+            }
+            let Some(models) = models else {
+                return field_err("models", "models must be a non-empty list");
+            };
+            groups.push((name.to_owned(), json_strings(&models)));
+            if let Some(Some(p)) = policy {
+                pols.insert(name.to_owned(), Value::Object(p));
+            }
+            (201, name.to_owned(), "group-create")
+        }
+        (&Method::PUT, Some(old)) => {
+            let Some(i) = groups.iter().position(|(n, _)| *n == old) else {
+                return err(404, "no such group");
+            };
+            let name = body
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or(&old)
+                .to_owned();
+            if name != old {
+                if !config::valid_group_name(&name) {
+                    return field_err("name", "use letters, digits . _ - (max 40)");
+                }
+                if groups.iter().any(|(n, _)| *n == name) {
+                    return json_response(
+                        409,
+                        &json!({"error": format!("group {name} already exists"), "field": "name"}),
+                        &[],
+                    );
+                }
+                for (_, l) in groups.iter_mut() {
+                    for e in l.iter_mut() {
+                        if *e == old {
+                            e.clone_from(&name);
+                        }
+                    }
+                }
+                groups[i].0.clone_from(&name);
+                if let Some(p) = pols.remove(&old) {
+                    pols.insert(name.clone(), p);
+                }
+                st.pins.clear(&old, None);
+            }
+            if let Some(m) = models {
+                groups[i].1 = json_strings(&m);
+            }
+            match policy {
+                Some(Some(p)) => {
+                    pols.insert(name.clone(), Value::Object(p));
+                }
+                Some(None) => {
+                    pols.remove(&name);
+                }
+                None => {}
+            }
+            (200, name, "group-update")
+        }
+        (&Method::DELETE, Some(old)) => {
+            if !groups.iter().any(|(n, _)| *n == old) {
+                return err(404, "no such group");
+            }
+            groups.retain(|(n, _)| *n != old);
+            pols.remove(&old);
+            st.pins.clear(&old, None);
+            (200, old, "group-delete")
+        }
+        _ => return err(405, "method not allowed"),
+    };
+    let obj: serde_json::Map<String, Value> =
+        groups.iter().map(|(n, l)| (n.clone(), json!(l))).collect();
+    let groups = match config::validate(&json!({ "chains": obj })) {
+        Ok((g, _)) => g,
+        Err(e) => {
+            log("config_rejected", json!({"error": e, "via": note}));
+            return field_err("models", &e);
+        }
+    };
+    if let Err(e) = config::save_with(
+        &st.path,
+        &groups,
+        &serde_json::Map::new(),
+        Some(&pols),
+        note,
+    ) {
+        return err(500, &format!("could not save: {e}"));
+    }
+    log(
+        "config_saved",
+        json!({"groups": groups.iter().map(|c| c.0.clone()).collect::<Vec<_>>(), "via": note, "group": name}),
+    );
+    let cfg = st.reload();
+    let group = cfg
+        .chain(&name)
+        .map(|l| group_json(st, &cfg, &name, l))
+        .unwrap_or(Value::Null);
+    json_response(
+        status,
+        &json!({"ok": true, "version": st.version(), "group": group}),
+        &[],
+    )
+}
+
+fn json_strings(a: &[Value]) -> Vec<String> {
+    a.iter()
+        .map(|v| v.as_str().unwrap_or("").to_owned())
+        .collect()
+}
+
 async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_owned();
@@ -127,13 +543,27 @@ async fn handle(State(st): State<Arc<AppState>>, req: Request) -> Response<Body>
                 "chains": cfg.root.get("chains").cloned().unwrap_or_else(|| json!({})),
                 "version": st.version(),
                 "settings": config::SETTING_BOUNDS.iter().filter_map(|(k, _, _)| cfg.root.get(*k).map(|v| ((*k).to_owned(), v.clone()))).collect::<serde_json::Map<_, _>>(),
-                "defaults": {"timeout": 90, "ttfb_stream": 20, "stream_idle": 120, "max_tokens_cap": 32768},
+                "defaults": {"timeout": 90, "ttfb_stream": 20, "stream_idle": 120, "max_tokens_cap": 32768, "keepalive": 10},
+                "policies": cfg.policies(),
+                "policy_defaults": Policy::default().to_json(),
+                "policy_fields": policy::fields(),
                 "paid_providers": cfg.paid_providers,
                 "auth_required": st.admin_token.is_some(),
             }),
             &[],
         ),
         (&Method::GET, "/_gateway/config/history") => history(&st),
+        (&Method::GET, "/_gateway/groups" | "/_gateway/groups/") => groups_list(&st, &cfg),
+        (&Method::POST, "/_gateway/groups" | "/_gateway/groups/") => {
+            group_write(&st, &parts.headers, &Method::POST, None, &raw)
+        }
+        (m @ (&Method::PUT | &Method::DELETE), p) if p.starts_with("/_gateway/groups/") => {
+            let name = pct(&p["/_gateway/groups/".len()..]);
+            group_write(&st, &parts.headers, m, Some(name), &raw)
+        }
+        (&Method::GET, "/_gateway/pins") => pins_get(&st, &parts.uri, &parts.headers),
+        (&Method::PUT | &Method::POST, "/_gateway/pins") => pins_put(&st, &parts.headers, &raw),
+        (&Method::DELETE, "/_gateway/pins") => pins_delete(&st, &parts.uri, &parts.headers),
         (&Method::PUT, "/_gateway/config") => save_config(&st, &parts.headers, &raw),
         (&Method::POST, "/_gateway/config/restore") => restore(&st, &parts.headers, &raw),
         (&Method::POST, "/_gateway/test") => test(&st, &cfg, &parts.headers, &raw).await,
@@ -268,7 +698,10 @@ fn save_config(st: &AppState, h: &HeaderMap, raw: &Bytes) -> Response<Body> {
     };
     let (chains, settings) = match config::validate(&body) {
         Ok(x) => x,
-        Err(e) => return err(400, &e),
+        Err(e) => {
+            log("config_rejected", json!({"error": e}));
+            return err(400, &e);
+        }
     };
     if body.get("version").map(|v| {
         v.as_str()
@@ -282,7 +715,18 @@ fn save_config(st: &AppState, h: &HeaderMap, raw: &Bytes) -> Response<Body> {
             &[],
         );
     }
-    if let Err(e) = config::save(&st.path, &chains, &settings, "save") {
+    let policies = match body.get("policies").filter(|p| !p.is_null()) {
+        Some(p) => match config::validate_policies(p, &chains) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                log("config_rejected", json!({"error": e}));
+                return field_err("policies", &e);
+            }
+        },
+        None => None,
+    };
+    let _lock = st.write_lock.lock().unwrap();
+    if let Err(e) = config::save_with(&st.path, &chains, &settings, policies.as_ref(), "save") {
         return err(500, &format!("could not save: {e}"));
     }
     log(
@@ -326,7 +770,17 @@ fn restore(st: &AppState, h: &HeaderMap, raw: &Bytes) -> Response<Body> {
             Ok(x) => x,
             Err(e) => return err(400, &e),
         };
-    if let Err(e) = config::save(&st.path, &chains, &settings, "before-restore") {
+    let policies = old
+        .get("policies")
+        .and_then(|p| config::validate_policies(p, &chains).ok());
+    let _lock = st.write_lock.lock().unwrap();
+    if let Err(e) = config::save_with(
+        &st.path,
+        &chains,
+        &settings,
+        policies.as_ref(),
+        "before-restore",
+    ) {
         return err(500, &format!("could not restore: {e}"));
     }
     st.reload();
@@ -444,15 +898,20 @@ async fn text(
     let model = model_of(&raw);
     match resolve(st, cfg, &model) {
         Some(list) => {
+            let (list, plan) = match plan_for(st, cfg, &model, h, list) {
+                Ok(x) => x,
+                Err(r) => return r,
+            };
             relay(
                 st,
                 targets_for(st, cfg, &list),
                 raw,
                 Opts {
-                    path,
+                    path: path.to_owned(),
                     kind: format!("chain:{model}"),
-                    headers: h,
+                    headers: h.clone(),
                     translate: None,
+                    plan,
                 },
             )
             .await
@@ -464,10 +923,11 @@ async fn text(
                 vec![upstream_target(st, None)],
                 raw,
                 Opts {
-                    path,
+                    path: path.to_owned(),
                     kind: "passthrough".into(),
-                    headers: h,
+                    headers: h.clone(),
                     translate: None,
+                    plan: None,
                 },
             )
             .await
@@ -494,23 +954,32 @@ async fn messages(st: &Arc<AppState>, cfg: &Config, h: &HeaderMap, raw: Bytes) -
             vec![upstream_target(st, None)],
             raw,
             Opts {
-                path: "/v1/messages",
+                path: "/v1/messages".into(),
                 kind: "passthrough".into(),
-                headers: h,
+                headers: h.clone(),
                 translate: None,
+                plan: None,
             },
         )
         .await;
     }
     let body = Bytes::from(shim::to_openai(&a, cfg.settings.max_tokens_cap).to_string());
-    let (targets, kind) = match &chain_list {
-        Some(list) => (
-            targets_for(st, cfg, list),
-            format!("anthropic:chain:{}", chain::bare(&model)),
-        ),
+    let (targets, kind, plan) = match chain_list {
+        Some(list) => {
+            let (list, plan) = match plan_for(st, cfg, &model, h, list) {
+                Ok(x) => x,
+                Err(r) => return r,
+            };
+            (
+                targets_for(st, cfg, &list),
+                format!("anthropic:chain:{}", chain::bare(&model)),
+                plan,
+            )
+        }
         None => (
             vec![upstream_target(st, None)],
             "anthropic:direct".to_owned(),
+            None,
         ),
     };
     relay(
@@ -518,10 +987,11 @@ async fn messages(st: &Arc<AppState>, cfg: &Config, h: &HeaderMap, raw: Bytes) -
         targets,
         body,
         Opts {
-            path: "/v1/chat/completions",
+            path: "/v1/chat/completions".into(),
             kind,
-            headers: h,
+            headers: h.clone(),
             translate: Some(model),
+            plan,
         },
     )
     .await
@@ -545,10 +1015,11 @@ async fn route(
         targets,
         raw,
         Opts {
-            path,
+            path: path.to_owned(),
             kind: format!("route:{path}"),
-            headers: h,
+            headers: h.clone(),
             translate: None,
+            plan: None,
         },
     )
     .await

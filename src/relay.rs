@@ -1,6 +1,8 @@
 //! Forwarding a request through an ordered list of targets, failing over on trouble.
 
 use crate::pii::{self, Rehydrate, SseRehydrator, Tier};
+use crate::pins::Event;
+use crate::policy::{Mode, Policy};
 use crate::shim;
 use crate::state::{hms, log, AppState, Recent};
 use axum::body::Body;
@@ -70,14 +72,15 @@ impl Target {
     }
 }
 
-pub struct Opts<'a> {
+pub struct Opts {
     /// Path used for the upstream request (and to pick the cooldown "API shape").
-    pub path: &'a str,
+    pub path: String,
     pub kind: String,
-    pub headers: &'a HeaderMap,
+    pub headers: HeaderMap,
     /// Set when the client spoke Anthropic `/v1/messages`: `payload` is already the equivalent
     /// chat-completions body and the reply is converted back. Holds the model name to echo.
     pub translate: Option<String>,
+    pub plan: Option<Plan>,
 }
 
 pub fn json_response(status: u16, v: &Value, extra: &[(&str, String)]) -> Response<Body> {
@@ -100,7 +103,10 @@ fn apply_headers(
     let mut has_ct = false;
     for (k, v) in h {
         let n = k.as_str();
-        if HOP.contains(&n) || (masked && pii::CONV_HEADERS.contains(&n)) {
+        if HOP.contains(&n)
+            || n.starts_with("x-luna-")
+            || (masked && pii::CONV_HEADERS.contains(&n))
+        {
             continue;
         }
         // Anthropic-style client credentials mean nothing to a chat-completions upstream.
@@ -402,13 +408,234 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Try `targets` in order (healthy ones first) until one answers.
+/// Errors worth one more try on the same model before failing over.
+const RETRYABLE: &[u16] = &[408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524];
+
+pub struct Plan {
+    pub group: String,
+    pub policy: Policy,
+    pub session: Option<String>,
+    pub key: Option<String>,
+    pub pin: Option<String>,
+    pub explicit: Option<String>,
+    pub list: Vec<String>,
+}
+
+struct Meta {
+    group: String,
+    served: Option<String>,
+    failover: Option<(String, String, String)>,
+    session: Option<String>,
+    pin: &'static str,
+    policy: Option<String>,
+}
+
+impl Meta {
+    fn apply(&self, h: &mut HeaderMap) {
+        let mut put = |k: &'static str, v: &str| {
+            if let Ok(v) = header::HeaderValue::from_str(v) {
+                h.insert(k, v);
+            }
+        };
+        put("x-served-model", self.served.as_deref().unwrap_or("none"));
+        put("x-served-group", &self.group);
+        put("x-luna-session", self.session.as_deref().unwrap_or("-"));
+        put("x-pin", self.pin);
+        if let Some((from, to, why)) = &self.failover {
+            put("x-failover", &format!("{from} -> {to}; reason={why}"));
+        }
+        if let Some(p) = &self.policy {
+            put("x-gateway-policy", p);
+        }
+    }
+
+    fn served_json(&self) -> Value {
+        json!({"model": self.served, "group": self.group, "session": self.session, "pin": self.pin,
+               "failover": self.failover.as_ref().map(|(f, t, r)| json!({"from": f, "to": t, "reason": r}))})
+    }
+}
+
+fn reason_of(a: &Value) -> String {
+    if let Some(s) = a.get("status").and_then(Value::as_u64) {
+        return if SOFT.contains(&(s as u16)) {
+            format!("rejected {s}")
+        } else {
+            format!("status {s}")
+        };
+    }
+    let e = a.get("error").and_then(Value::as_str).unwrap_or("error");
+    if e.starts_with("presence") {
+        "presence".into()
+    } else if e == "input too large" {
+        "input-too-large".into()
+    } else {
+        e.to_owned()
+    }
+}
+
+fn first_reason(attempts: &[Value], label: &str, cooling: bool) -> String {
+    attempts
+        .iter()
+        .rev()
+        .find(|a| a["target"] == label && a.get("retry").is_none())
+        .map(reason_of)
+        .unwrap_or_else(|| {
+            if cooling {
+                "cooldown".into()
+            } else {
+                "skipped".into()
+            }
+        })
+}
+
+fn header_str(h: &HeaderMap, k: &str) -> String {
+    h.get(k)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Test traffic (`X-Luna-Test`, or a session id starting with `test`) keeps its own cooldowns,
+/// so failures it provokes never change what answers real chats.
+pub fn is_test(h: &HeaderMap) -> bool {
+    let v = |n: &str| h.get(n).and_then(|v| v.to_str().ok()).map(str::trim);
+    if v("x-luna-test").is_some_and(|t| !t.is_empty() && t != "0" && t != "false") {
+        return true;
+    }
+    [
+        "x-luna-session",
+        "x-conversation-id",
+        "x-hermes-session-id",
+        "x-session-id",
+    ]
+    .iter()
+    .find_map(|n| v(n).filter(|s| !s.is_empty()))
+    .is_some_and(|s| s.to_ascii_lowercase().starts_with("test"))
+}
+
+pub fn is_stream(payload: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(payload)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        == Some(true)
+}
+
+/// Streams that have not started after `keepalive` seconds get their headers early, then
+/// keepalives, so proxies and phone clients don't drop the connection while models fail over.
 pub async fn relay(
     st: &Arc<AppState>,
     targets: Vec<Target>,
     payload: Bytes,
-    o: Opts<'_>,
+    o: Opts,
 ) -> Response<Body> {
+    if !is_stream(&payload) {
+        return walk(st.clone(), targets, payload, o).await;
+    }
+    let ka = Duration::from_secs_f64(st.config().settings.keepalive);
+    let anthropic = o.translate.is_some();
+    let early = Meta {
+        group: o
+            .plan
+            .as_ref()
+            .map(|p| p.group.clone())
+            .unwrap_or_else(|| "-".into()),
+        served: targets.first().map(|t| t.label.clone()),
+        failover: None,
+        session: o.plan.as_ref().and_then(|p| p.session.clone()),
+        pin: "pending",
+        policy: o.plan.as_ref().map(|p| p.policy.header()),
+    };
+    let mut task = tokio::spawn(walk(st.clone(), targets, payload, o));
+    match tokio::time::timeout(ka, &mut task).await {
+        Ok(Ok(r)) => return r,
+        Ok(Err(_)) => {
+            return json_response(
+                500,
+                &json!({"error": {"message": "gateway task failed"}}),
+                &[],
+            )
+        }
+        Err(_) => {}
+    }
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(ka);
+        tick.tick().await;
+        let _ = tx
+            .send(Ok(Bytes::from_static(crate::stream::KEEPALIVE)))
+            .await;
+        let resp = loop {
+            tokio::select! {
+                r = &mut task => break r.ok(),
+                _ = tick.tick() => {
+                    if tx.send(Ok(Bytes::from_static(crate::stream::KEEPALIVE))).await.is_err() {
+                        task.abort();
+                        return;
+                    }
+                }
+            }
+        };
+        let Some(resp) = resp else {
+            let v = json!({"message": "gateway task failed", "type": "gateway_error"});
+            let _ = tx.send(Ok(crate::stream::error_event(anthropic, &v))).await;
+            return;
+        };
+        let sse = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|c| c.contains("event-stream"));
+        if resp.status().is_success() && sse {
+            let mut s = resp.into_body().into_data_stream();
+            while let Some(b) = s.next().await {
+                let item = b.map_err(|e| std::io::Error::other(e.to_string()));
+                let stop = item.is_err();
+                if tx.send(item).await.is_err() || stop {
+                    return;
+                }
+            }
+            return;
+        }
+        let status = resp.status().as_u16();
+        let model = header_str(resp.headers(), "x-served-model");
+        let failover = header_str(resp.headers(), "x-failover");
+        let data = axum::body::to_bytes(resp.into_body(), 65_536)
+            .await
+            .unwrap_or_default();
+        let body: Value = serde_json::from_slice(&data).unwrap_or(Value::Null);
+        let err = if body["error"]["gateway"].is_object() {
+            body["error"]["gateway"].clone()
+        } else {
+            body["error"].clone()
+        };
+        let msg = err["message"]
+            .as_str()
+            .or(err.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| String::from_utf8_lossy(&data[..data.len().min(500)]).into_owned());
+        let v = json!({"message": msg, "type": err["type"].as_str().unwrap_or("gateway_exhausted"),
+                       "reason": err["reason"], "model": err.get("model").cloned().unwrap_or(json!(model)),
+                       "failover": failover, "status": status});
+        let _ = tx.send(Ok(crate::stream::error_event(anthropic, &v))).await;
+    });
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("x-gateway-early", "1");
+    if let Some(h) = b.headers_mut() {
+        early.apply(h);
+    }
+    b.body(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ))
+    .unwrap()
+}
+
+/// Try `targets` in order (healthy ones first) until one answers, following the group's policy.
+async fn walk(st: Arc<AppState>, targets: Vec<Target>, payload: Bytes, o: Opts) -> Response<Body> {
+    let st = &st;
+    let started = Instant::now();
     let cfg = st.config();
     let parsed: Option<Value> = serde_json::from_slice(&payload).ok();
     let req_model = parsed
@@ -422,30 +649,66 @@ pub async fn relay(
         .and_then(|v| v.get("stream"))
         .and_then(Value::as_bool)
         == Some(true);
+    let policy = o.plan.as_ref().map(|p| p.policy.clone());
+    let strict = policy.as_ref().is_some_and(|p| p.mode == Mode::Strict);
+    let retries = policy.as_ref().map(|p| p.retry_same_model).unwrap_or(0);
+    let cool_base = policy.as_ref().map(|p| p.cooldown_seconds).unwrap_or(30);
+    let stop_on_timeout = policy.as_ref().is_some_and(|p| !p.failover_on_timeouts);
     // A streaming reply starts fast or never; a buffered one may legitimately take a while.
     let ttfb = Duration::from_secs_f64(if streaming {
-        cfg.settings.ttfb_stream
+        policy
+            .as_ref()
+            .and_then(|p| p.ttfb_seconds)
+            .unwrap_or(cfg.settings.ttfb_stream)
     } else {
-        cfg.settings.timeout
+        policy
+            .as_ref()
+            .and_then(|p| p.total_timeout_seconds)
+            .unwrap_or(cfg.settings.timeout)
     });
+    let total = policy
+        .as_ref()
+        .and_then(|p| p.total_timeout_seconds)
+        .map(Duration::from_secs_f64);
     let idle = Duration::from_secs_f64(cfg.settings.stream_idle);
+    let ns = if is_test(&o.headers) { "test:" } else { "" };
     let family = if o.path == "/v1/messages" {
         "anthropic"
     } else {
         "openai"
     }; // cooldowns are per API shape
 
+    let intended = targets.first().map(|t| t.label.clone()).unwrap_or_default();
     let keyed: Vec<(String, Target)> = targets
         .into_iter()
-        .map(|t| (format!("{family}:{}", t.label), t))
+        .map(|t| (format!("{ns}{family}:{}", t.label), t))
         .collect();
-    let (mut ordered, cooling): (Vec<_>, Vec<_>) =
-        keyed.into_iter().partition(|(k, _)| !st.in_cooldown(k));
-    ordered.extend(cooling); // cooled-down targets stay as a last resort
+    let intended_cooling = keyed.first().is_some_and(|(k, _)| st.in_cooldown(k));
+    let ordered: Vec<(String, Target)> = if strict {
+        keyed.into_iter().take(1).collect()
+    } else {
+        let (mut ordered, cooling): (Vec<_>, Vec<_>) =
+            keyed.into_iter().partition(|(k, _)| !st.in_cooldown(k));
+        ordered.extend(cooling); // cooled-down targets stay as a last resort
+        ordered
+    };
+    let mut meta = Meta {
+        group: o
+            .plan
+            .as_ref()
+            .map(|p| p.group.clone())
+            .unwrap_or_else(|| "-".into()),
+        served: None,
+        failover: None,
+        session: o.plan.as_ref().and_then(|p| p.session.clone()),
+        pin: "none",
+        policy: policy.as_ref().map(Policy::header),
+    };
 
     let mut attempts: Vec<Value> = Vec::new();
     let mut last: Option<(u16, Option<header::HeaderValue>, Bytes)> = None;
-    let ckey = pii::conv_key(o.headers, parsed.as_ref());
+    let mut stopped: Option<String> = None;
+    let ckey = pii::conv_key(&o.headers, parsed.as_ref());
     let mut ner_by_tier: HashMap<Tier, Result<Vec<pii::ner::Found>, String>> = HashMap::new();
     'targets: for (key, mut t) in ordered {
         if t.max_input.is_some_and(|n| payload.len() > n) {
@@ -535,71 +798,104 @@ pub async fn relay(
         let url = format!(
             "{}{}",
             t.base.trim_end_matches('/'),
-            t.path.as_deref().unwrap_or(o.path)
+            t.path.as_deref().unwrap_or(&o.path)
         );
         let mut body = body;
         let mut dropped = false;
-        let t0 = Instant::now();
+        let mut tries_left = if t.label == intended { retries } else { 0 };
+        let mut t0;
         let resp = loop {
+            t0 = Instant::now();
             let rb = apply_headers(
                 st.client.post(&url).body(body.clone()),
-                o.headers,
+                &o.headers,
                 &t,
                 o.translate.is_some(),
                 masking,
             );
-            let resp = match tokio::time::timeout(wait, rb.send()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    st.mark_bad(&key, "connect", None);
-                    attempts.push(json!({"target": t.label, "error": if e.is_timeout() { "timeout" } else { "connect" }}));
-                    continue 'targets;
+            let failed = match tokio::time::timeout(wait, rb.send()).await {
+                Ok(Ok(r)) => {
+                    let status = r.status().as_u16();
+                    if !(HARD.contains(&status) || SOFT.contains(&status)) {
+                        break r;
+                    }
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .map(|n| n.min(300));
+                    let ct = r.headers().get(header::CONTENT_TYPE).cloned();
+                    let data = r.bytes().await.unwrap_or_default();
+                    let data = data.slice(..data.len().min(65_536));
+                    if SOFT.contains(&status) && !dropped {
+                        if let Some((nb, names)) = without_rejected_fields(&body, &data) {
+                            attempts.push(json!({"target": t.label, "status": status, "error": format!("retried without {}", names.join(", ")), "retry": true}));
+                            dropped = true;
+                            body = nb;
+                            continue;
+                        }
+                    }
+                    let wrong_shape = status == 404 && contains(&data, b"is available via");
+                    if RETRYABLE.contains(&status) && tries_left > 0 {
+                        tries_left -= 1;
+                        attempts.push(json!({"target": t.label, "status": status, "retry": true}));
+                        let pause = retry_after.unwrap_or(1).clamp(1, 5);
+                        tokio::time::sleep(Duration::from_secs(pause)).await;
+                        continue;
+                    }
+                    if HARD.contains(&status) && !wrong_shape {
+                        st.mark_bad(&key, &status.to_string(), retry_after, cool_base);
+                    }
+                    attempts.push(json!({"target": t.label, "status": status}));
+                    last = Some((status, ct, data));
+                    None
                 }
-                Err(_) => {
-                    st.mark_bad(&key, "timeout", None);
-                    attempts.push(json!({"target": t.label, "error": "timeout"}));
-                    continue 'targets;
-                }
+                Ok(Err(e)) => Some(if e.is_timeout() { "timeout" } else { "connect" }),
+                Err(_) => Some("timeout"),
             };
-            let status = resp.status().as_u16();
-            if !(HARD.contains(&status) || SOFT.contains(&status)) {
-                break resp;
-            }
-            let retry_after = resp
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(|n| n.min(300));
-            let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
-            let data = resp.bytes().await.unwrap_or_default();
-            let data = data.slice(..data.len().min(65_536));
-            if SOFT.contains(&status) && !dropped {
-                if let Some((nb, names)) = without_rejected_fields(&body, &data) {
-                    attempts.push(json!({"target": t.label, "status": status, "error": format!("retried without {}", names.join(", "))}));
-                    dropped = true;
-                    body = nb;
+            if let Some(what) = failed {
+                if what == "connect" && tries_left > 0 {
+                    tries_left -= 1;
+                    attempts.push(json!({"target": t.label, "error": what, "retry": true}));
+                    tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
+                st.mark_bad(&key, what, None, cool_base);
+                attempts.push(json!({"target": t.label, "error": what}));
+                if what == "timeout" && stop_on_timeout {
+                    stopped = Some(format!("timeout after {}s", wait.as_secs()));
+                    break 'targets;
+                }
             }
-            let wrong_shape = status == 404 && contains(&data, b"is available via");
-            if HARD.contains(&status) && !wrong_shape {
-                st.mark_bad(&key, &status.to_string(), retry_after);
-            }
-            attempts.push(json!({"target": t.label, "status": status}));
-            last = Some((status, ct, data));
             continue 'targets;
         };
         let status = resp.status().as_u16();
         // Success.
         st.mark_good(&key, &t.label);
         let ms = t0.elapsed().as_millis() as u64;
-        if !attempts.is_empty() {
+        if attempts.iter().any(|a| a.get("retry").is_none()) {
             st.stats.lock().unwrap().failovers += 1;
+        }
+        meta.served = Some(if t.label == "upstream" && req_model != "-" {
+            req_model.clone()
+        } else {
+            t.label.clone()
+        });
+        if t.label != intended && !intended.is_empty() {
+            meta.failover = Some((
+                intended.clone(),
+                t.label.clone(),
+                first_reason(&attempts, &intended, intended_cooling),
+            ));
+        }
+        if let Some(p) = &o.plan {
+            settle_pin(st, p, &mut meta);
         }
         log(
             "served",
-            json!({"kind": o.kind, "path": o.path, "target": t.label, "status": status, "ttfb_ms": ms, "skipped": attempts, "pii": info}),
+            json!({"kind": o.kind, "path": o.path, "target": t.label, "status": status, "ttfb_ms": ms, "skipped": attempts, "pii": info,
+                   "group": meta.group, "session": meta.session, "pin": meta.pin}),
         );
         let n = attempts.len() + 1;
         let p = Pii {
@@ -616,17 +912,36 @@ pub async fn relay(
             skipped: attempts,
             pii: info,
         });
-        return match o.translate {
+        let anthropic = o.translate.is_some();
+        let resp = match o.translate {
             None => passthrough(resp, &t.label, n, idle, ttfb, p).await,
             Some(model) if streaming => translated_stream(resp, model, &t.label, n, idle, p),
             Some(model) => translated_buffered(resp, &model, &t.label, n, ttfb, p).await,
         };
+        let ka = Duration::from_secs_f64(cfg.settings.keepalive);
+        return finish(resp, &meta, started, ms, ka, total, anthropic);
     }
 
     st.stats.lock().unwrap().errors += 1;
+    let reason = stopped
+        .clone()
+        .unwrap_or_else(|| first_reason(&attempts, &intended, intended_cooling));
+    if let Some(p) = &o.plan {
+        if !intended.is_empty() {
+            st.pins.event(Event {
+                time: crate::pins::now(),
+                group: p.group.clone(),
+                session: p.session.clone().unwrap_or_default(),
+                from: intended.clone(),
+                to: None,
+                reason: reason.clone(),
+            });
+        }
+    }
     log(
         "exhausted",
-        json!({"kind": o.kind, "path": o.path, "attempts": attempts}),
+        json!({"kind": o.kind, "path": o.path, "attempts": attempts, "group": meta.group, "session": meta.session,
+               "strict": strict, "stopped": stopped}),
     );
     st.note(Recent {
         time: hms(),
@@ -638,7 +953,39 @@ pub async fn relay(
         skipped: attempts.clone(),
         pii: None,
     });
-    if o.translate.is_some() {
+    let gateway_err = if strict {
+        Some((
+            503,
+            "gateway_strict",
+            format!("strict group {}: {intended} failed ({reason})", meta.group),
+        ))
+    } else {
+        stopped.as_ref().map(|s| {
+            (
+                504,
+                "gateway_timeout",
+                format!(
+                    "group {}: {intended} did not answer ({s}); failover_on=errors",
+                    meta.group
+                ),
+            )
+        })
+    };
+    let mut resp = if let Some((code, kind, msg)) = gateway_err {
+        let upstream_status = last.as_ref().map(|l| l.0);
+        let e = json!({"message": msg, "type": kind, "reason": reason, "model": intended, "upstream_status": upstream_status});
+        if o.translate.is_some() {
+            let mut b = shim::error_body(code, &msg);
+            b["error"]["gateway"] = e;
+            json_response(code, &b, &[("x-gateway-exhausted", "1".into())])
+        } else {
+            json_response(
+                code,
+                &json!({ "error": e }),
+                &[("x-gateway-exhausted", "1".into())],
+            )
+        }
+    } else if o.translate.is_some() {
         let (code, msg) = match &last {
             Some((c, _, d)) => (
                 *c,
@@ -649,28 +996,123 @@ pub async fn relay(
                 format!("all targets failed: {}", Value::Array(attempts)),
             ),
         };
-        return json_response(
+        json_response(
             code,
             &shim::error_body(code, &msg),
             &[("x-gateway-exhausted", "1".into())],
-        );
+        )
+    } else {
+        match last {
+            Some((c, ct, d)) => Response::builder()
+                .status(StatusCode::from_u16(c).unwrap_or(StatusCode::BAD_GATEWAY))
+                .header(
+                    header::CONTENT_TYPE,
+                    ct.unwrap_or_else(|| header::HeaderValue::from_static("application/json")),
+                )
+                .header("x-gateway-exhausted", "1")
+                .body(Body::from(d))
+                .unwrap(),
+            None => json_response(
+                502,
+                &json!({"error": {"message": "all targets failed", "type": "gateway_exhausted", "reason": reason, "attempts": attempts}}),
+                &[],
+            ),
+        }
+    };
+    meta.apply(resp.headers_mut());
+    resp
+}
+
+fn settle_pin(st: &AppState, p: &Plan, meta: &mut Meta) {
+    let served = meta.served.clone().unwrap_or_default();
+    if let Some((from, to, why)) = &meta.failover {
+        st.pins.event(Event {
+            time: crate::pins::now(),
+            group: p.group.clone(),
+            session: p.session.clone().unwrap_or_default(),
+            from: from.clone(),
+            to: Some(to.clone()),
+            reason: why.clone(),
+        });
     }
-    match last {
-        Some((c, ct, d)) => Response::builder()
-            .status(StatusCode::from_u16(c).unwrap_or(StatusCode::BAD_GATEWAY))
-            .header(
-                header::CONTENT_TYPE,
-                ct.unwrap_or_else(|| header::HeaderValue::from_static("application/json")),
-            )
-            .header("x-gateway-exhausted", "1")
-            .body(Body::from(d))
-            .unwrap(),
-        None => json_response(
-            502,
-            &json!({"error": {"message": "all targets failed", "attempts": attempts}}),
-            &[],
-        ),
+    let Some(key) = p.key.as_deref().filter(|_| p.policy.mode != Mode::Failover) else {
+        meta.pin = "none";
+        return;
+    };
+    let hold = meta
+        .failover
+        .as_ref()
+        .is_some_and(|f| matches!(f.2.as_str(), "presence" | "input-too-large"));
+    let set = |source: &str| {
+        st.pins.set(
+            &p.group,
+            key,
+            &served,
+            p.policy.scope,
+            p.policy.ttl_minutes,
+            source,
+            &p.list,
+        )
+    };
+    meta.pin = if hold && p.pin.is_some() {
+        st.pins.touch(&p.group, key);
+        "held"
+    } else if p.explicit.as_deref() == Some(served.as_str()) {
+        set("explicit");
+        "explicit"
+    } else if p.explicit.is_some() || (p.pin.is_some() && p.pin.as_deref() != Some(served.as_str()))
+    {
+        set("failover");
+        "moved"
+    } else if p.pin.is_some() {
+        st.pins.touch(&p.group, key);
+        "kept"
+    } else {
+        set("answered");
+        "new"
+    };
+}
+
+fn finish(
+    resp: Response<Body>,
+    meta: &Meta,
+    started: Instant,
+    ttfb_ms: u64,
+    keepalive: Duration,
+    total: Option<Duration>,
+    anthropic: bool,
+) -> Response<Body> {
+    let (mut parts, body) = resp.into_parts();
+    meta.apply(&mut parts.headers);
+    let sse = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|c| c.contains("event-stream"));
+    if !sse || !parts.status.is_success() {
+        return Response::from_parts(parts, body);
     }
+    let inner: crate::stream::BoxStream = Box::pin(
+        body.into_data_stream()
+            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string()))),
+    );
+    let ctx = crate::stream::Ctx {
+        prefix: Some(crate::stream::comment(
+            "gateway-served",
+            &meta.served_json(),
+        )),
+        model: meta.served.clone().unwrap_or_default(),
+        group: meta.group.clone(),
+        started,
+        ttfb_ms,
+        keepalive,
+        total,
+        anthropic,
+    };
+    Response::from_parts(
+        parts,
+        Body::from_stream(crate::stream::decorate(inner, ctx)),
+    )
 }
 
 pub async fn forward_raw(
@@ -733,7 +1175,10 @@ pub async fn forward_raw(
     let mut rb = st.client.request(method.clone(), &url);
     for (k, v) in headers {
         let n = k.as_str();
-        if !HOP.contains(&n) && !(masking && pii::CONV_HEADERS.contains(&n)) {
+        if !HOP.contains(&n)
+            && !n.starts_with("x-luna-")
+            && !(masking && pii::CONV_HEADERS.contains(&n))
+        {
             rb = rb.header(k, v);
         }
     }
