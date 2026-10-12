@@ -97,7 +97,7 @@ docker run -d --name modelgate \
 tailscale serve --bg 8080
 ```
 
-Or, from this repo, `docker compose up -d` (set `UPSTREAM` to your Aperture tailnet IP first). The compose file ships with `build: .` so it works before the image is published; once the repo is public, swap to `image: ghcr.io/shreyammaity/modelgate:latest` and drop `build:`.
+Or, from this repo, `docker compose up -d` (set `UPSTREAM` to your Aperture tailnet IP first). It pulls `ghcr.io/shreyammaity/modelgate:latest`; pin a version tag such as `0.3.1` if you prefer, or swap `image:` for `build: .` to build from source.
 
 ### systemd
 
